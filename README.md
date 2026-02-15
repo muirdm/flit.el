@@ -4,6 +4,14 @@ Flit is a faster and less annoying TRAMP. flit.el connects over JSON-RPC to the 
 
 ## Quick Start
 
+Install flit:
+
+```elisp
+(use-package flit
+  :vc (:url "https://github.com/muirdm/flit.el" :rev :newest)
+  :ensure t)
+```
+
 If you use EternalTerminal (recommended):
 
 ```elisp
