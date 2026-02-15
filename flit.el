@@ -29,6 +29,40 @@
 (require 'jsonrpc)
 (require 'eieio)
 
+;; Forward declarations for variables defined later in the file.
+;; These are needed because the public API section uses them before
+;; their canonical defvar.
+(defvar flit--connections)
+(defvar flit--connection-states)
+(defvar flit--sys-info)
+(defvar flit--cache)
+(defvar flit--tunnels)
+(defvar flit--processes)
+(defvar flit--process-host)
+(defvar flit--home-directory-cache)
+(defvar flit--deferred-buffers)
+(defvar flit--current-path)
+(defvar flit--force-allow-prompt)
+(defvar flit--pending-restore nil
+  "Non-nil while a desktop restore is pending.")
+
+;; Forward declarations for functions defined inside with-eval-after-load.
+(declare-function lsp-session "ext:lsp-mode")
+(declare-function lsp-session-folders "ext:lsp-mode")
+(declare-function marginalia-annotate-file "ext:marginalia")
+(declare-function marginalia-annotate-buffer "ext:marginalia")
+(declare-function flit--setup-desktop-save "flit")
+(declare-function flit--desktop-read-advice "flit")
+(declare-function flit--desktop-create-buffer-advice "flit")
+(declare-function flit--lsp-mode-hook "flit")
+(declare-function flit--maybe-prefetch-lsp-workspace-folders "flit")
+(declare-function flit--prefetch-lsp-workspace-folders "flit")
+
+;; Forward declarations for variables from external packages.
+(defvar savehist-additional-variables)
+(defvar marginalia-remote-file-regexps)
+(defvar marginalia-annotators)
+
 ;;; Customization
 
 (defgroup flit nil
@@ -151,6 +185,161 @@ When nil (default), the verbose RPC traffic log is suppressed."
   :type 'boolean
   :group 'flit)
 
+;;; Logging
+
+(defvar flit--log-buffer-name "*flit-log*"
+  "Name of the buffer for flit debug logs.")
+
+(defvar flit--log-level-context nil
+  "Dynamically bound to the current log level context (info, debug, trace).
+Used by `flit--log-should-log' to apply level-specific filtering.")
+
+(defvar flit--log-last-msg nil
+  "The last logged message (without timestamp), for repeat compression.")
+
+(defvar flit--log-repeat-count 0
+  "Count of consecutive repeats of `flit--log-last-msg'.")
+
+(define-derived-mode flit-log-mode special-mode "Flit-Log"
+  "Major mode for viewing flit debug logs.
+\\{flit-log-mode-map}"
+  (setq-local truncate-lines t))
+
+(defun flit--clean-for-log (obj)
+  "Recursively strip text properties from strings in OBJ for clean logging."
+  (cond
+   ((stringp obj) (substring-no-properties obj))
+   ((consp obj) (cons (flit--clean-for-log (car obj))
+                      (flit--clean-for-log (cdr obj))))
+   ((vectorp obj) (apply #'vector (mapcar #'flit--clean-for-log obj)))
+   (t obj)))
+
+(defun flit--log-fn-label (fn)
+  "Return a short label for FN suitable for logging."
+  (cond
+   ((null fn) nil)
+   ((symbolp fn) (symbol-name fn))
+   (t "<lambda>")))
+
+(defun flit--log-should-log (msg _level)
+  "Return non-nil if MSG should be logged.
+Respects `flit-log-filter' when set.  MSG is the formatted string including the
+\"[flit]\" prefix."
+  (cond
+   ((null flit-log-filter) t)
+   ((stringp flit-log-filter)
+    (string-match-p flit-log-filter msg))
+   ((functionp flit-log-filter)
+    (funcall flit-log-filter msg))
+   (t t)))
+
+(defun flit--log (format-string &rest args)
+  "Log a message to the flit log buffer if `flit-log-level' is non-nil.
+Consecutive identical messages are compressed with a repeat count."
+  (when flit-log-level
+    (let* ((time (current-time))
+           (ms (/ (nth 2 time) 1000))
+           (msg (apply #'format (concat "[flit] " format-string)
+                       (mapcar #'flit--clean-for-log args))))
+      (when (flit--log-should-log msg flit--log-level-context)
+        (with-current-buffer (get-buffer-create flit--log-buffer-name)
+          (unless (derived-mode-p 'flit-log-mode)
+            (flit-log-mode)
+            ;; Ensure local default-directory so log buffer isn't a "remote" buffer
+            (setq default-directory (expand-file-name "~/")))
+          (let ((inhibit-read-only t))
+            (if (and flit--log-last-msg
+                     (string= msg flit--log-last-msg))
+                ;; Same message - increment counter and update in place
+                (progn
+                  (setq flit--log-repeat-count (1+ flit--log-repeat-count))
+                  (save-excursion
+                    (goto-char (point-max))
+                    (forward-line -1)
+                    (end-of-line)
+                    (when (looking-back " ([0-9]+x)" (line-beginning-position))
+                      (delete-region (match-beginning 0) (match-end 0)))
+                    (insert (format " (%dx)" (1+ flit--log-repeat-count)))))
+              ;; Different message - log new line
+              (setq flit--log-last-msg msg
+                    flit--log-repeat-count 0)
+              (save-excursion
+                (goto-char (point-max))
+                (insert (format-time-string "%H:%M:%S" time)
+                        (format ".%03d " ms)
+                        msg "\n")))))))))
+
+(defsubst flit--log-level-p (level)
+  "Return non-nil if LEVEL should be logged given current `flit-log-level'."
+  ;; Most common: log-level=info, level=trace -> return nil fast
+  (and flit-log-level
+       (cond
+        ((eq flit-log-level 'trace) t)
+        ((eq level 'info) t)  ; info logged at any non-nil level
+        ((eq flit-log-level 'debug) (eq level 'debug)))))
+
+(defmacro flit--log-info (format-string &rest args)
+  "Log an info-level message (RPC calls, significant events).
+Arguments are not evaluated if info logging is disabled."
+  `(when (flit--log-level-p 'info)
+     (let ((flit--log-level-context 'info))
+       (flit--log ,format-string ,@args))))
+
+(defmacro flit--log-debug (format-string &rest args)
+  "Log a debug-level message (handlers, notifications).
+Arguments are not evaluated if debug logging is disabled."
+  `(when (flit--log-level-p 'debug)
+     (let ((flit--log-level-context 'debug))
+       (flit--log ,format-string ,@args))))
+
+(defmacro flit--log-trace (format-string &rest args)
+  "Log a trace-level message (cache ops, very verbose).
+Arguments are not evaluated if trace logging is disabled."
+  `(when (flit--log-level-p 'trace)
+     (let ((flit--log-level-context 'trace))
+       (flit--log ,format-string ,@args))))
+
+(defmacro flit--log-error (format-string &rest args)
+  "Log an error message (always logged regardless of level)."
+  `(flit--log (concat "ERROR: " ,format-string) ,@args))
+
+(defun flit--sanitize-params-for-log (params)
+  "Return a copy of PARAMS with large :content values truncated for logging."
+  (let ((content (plist-get params :content)))
+    (if (and content (stringp content) (> (length content) 100))
+        (plist-put (copy-sequence params) :content
+                   (format "<%d bytes>" (length content)))
+      params)))
+
+(defun flit--simple-backtrace ()
+  "Return a simple backtrace string with just function names.
+Excludes special forms and macros to show only actual function calls."
+  (let ((frames nil)
+        (n 0))
+    (while (and (< n 60)
+                (let ((frame (backtrace-frame n)))
+                  (when frame
+                    (let ((fn (cadr frame)))
+                      (when (and fn (symbolp fn)
+                                 (not (special-form-p fn))
+                                 (not (macrop fn))
+                                 (not (string-prefix-p "flit--log" (symbol-name fn)))
+                                 (not (string-prefix-p "flit--simple" (symbol-name fn))))
+                        (push (symbol-name fn) frames)))
+                    t)))
+      (cl-incf n))
+    (string-join (nreverse frames) " <- ")))
+
+(defmacro flit--with-quit-log (desc &rest body)
+  "Execute BODY.  If interrupted by C-g, log DESC with backtrace, then re-quit."
+  (declare (indent 1))
+  `(condition-case nil
+       (progn ,@body)
+     (quit
+      (flit--log-info "C-g interrupted: %s\n  backtrace: %s"
+                      ,desc (flit--simple-backtrace))
+      (signal 'quit nil))))
+
 ;;; Public API
 
 (defvar flit-known-hosts nil
@@ -220,7 +409,8 @@ If CALLBACK is nil, connect synchronously:
 ;;;###autoload
 (defun flit-disconnect (host)
   "Disconnect from HOST, closing the connection.
-Uses `disconnected' state - explicit user action (find-file, flit-connect) needed to reconnect."
+Uses `disconnected' state - explicit user action (find-file,
+flit-connect) needed to reconnect."
   (interactive
    (list (completing-read "Disconnect from host: "
                           (hash-table-keys flit--connections)
@@ -490,161 +680,6 @@ Examples:
   /flit!dev:9999/path  - host:port with path
   /flit!dev            - does NOT match (no path yet)")
 
-;;; Logging
-
-(defvar flit--log-buffer-name "*flit-log*"
-  "Name of the buffer for flit debug logs.")
-
-(defvar flit--log-level-context nil
-  "Dynamically bound to the current log level context (info, debug, trace).
-Used by `flit--log-should-log' to apply level-specific filtering.")
-
-(defvar flit--log-last-msg nil
-  "The last logged message (without timestamp), for repeat compression.")
-
-(defvar flit--log-repeat-count 0
-  "Count of consecutive repeats of `flit--log-last-msg'.")
-
-(define-derived-mode flit-log-mode special-mode "Flit-Log"
-  "Major mode for viewing flit debug logs.
-\\{flit-log-mode-map}"
-  (setq-local truncate-lines t))
-
-(defun flit--clean-for-log (obj)
-  "Recursively strip text properties from strings in OBJ for clean logging."
-  (cond
-   ((stringp obj) (substring-no-properties obj))
-   ((consp obj) (cons (flit--clean-for-log (car obj))
-                      (flit--clean-for-log (cdr obj))))
-   ((vectorp obj) (apply #'vector (mapcar #'flit--clean-for-log obj)))
-   (t obj)))
-
-(defun flit--log-fn-label (fn)
-  "Return a short label for FN suitable for logging."
-  (cond
-   ((null fn) nil)
-   ((symbolp fn) (symbol-name fn))
-   (t "<lambda>")))
-
-(defun flit--log-should-log (msg _level)
-  "Return non-nil if MSG should be logged.
-Respects `flit-log-filter' when set.  MSG is the formatted string including the
-\"[flit]\" prefix."
-  (cond
-   ((null flit-log-filter) t)
-   ((stringp flit-log-filter)
-    (string-match-p flit-log-filter msg))
-   ((functionp flit-log-filter)
-    (funcall flit-log-filter msg))
-   (t t)))
-
-(defun flit--log (format-string &rest args)
-  "Log a message to the flit log buffer if `flit-log-level' is non-nil.
-Consecutive identical messages are compressed with a repeat count."
-  (when flit-log-level
-    (let* ((time (current-time))
-           (ms (/ (nth 2 time) 1000))
-           (msg (apply #'format (concat "[flit] " format-string)
-                       (mapcar #'flit--clean-for-log args))))
-      (when (flit--log-should-log msg flit--log-level-context)
-        (with-current-buffer (get-buffer-create flit--log-buffer-name)
-          (unless (derived-mode-p 'flit-log-mode)
-            (flit-log-mode)
-            ;; Ensure local default-directory so log buffer isn't a "remote" buffer
-            (setq default-directory (expand-file-name "~/")))
-          (let ((inhibit-read-only t))
-            (if (and flit--log-last-msg
-                     (string= msg flit--log-last-msg))
-                ;; Same message - increment counter and update in place
-                (progn
-                  (setq flit--log-repeat-count (1+ flit--log-repeat-count))
-                  (save-excursion
-                    (goto-char (point-max))
-                    (forward-line -1)
-                    (end-of-line)
-                    (when (looking-back " ([0-9]+x)" (line-beginning-position))
-                      (delete-region (match-beginning 0) (match-end 0)))
-                    (insert (format " (%dx)" (1+ flit--log-repeat-count)))))
-              ;; Different message - log new line
-              (setq flit--log-last-msg msg
-                    flit--log-repeat-count 0)
-              (save-excursion
-                (goto-char (point-max))
-                (insert (format-time-string "%H:%M:%S" time)
-                        (format ".%03d " ms)
-                        msg "\n")))))))))
-
-(defsubst flit--log-level-p (level)
-  "Return non-nil if LEVEL should be logged given current `flit-log-level'."
-  ;; Most common: log-level=info, level=trace -> return nil fast
-  (and flit-log-level
-       (cond
-        ((eq flit-log-level 'trace) t)
-        ((eq level 'info) t)  ; info logged at any non-nil level
-        ((eq flit-log-level 'debug) (eq level 'debug)))))
-
-(defmacro flit--log-info (format-string &rest args)
-  "Log an info-level message (RPC calls, significant events).
-Arguments are not evaluated if info logging is disabled."
-  `(when (flit--log-level-p 'info)
-     (let ((flit--log-level-context 'info))
-       (flit--log ,format-string ,@args))))
-
-(defmacro flit--log-debug (format-string &rest args)
-  "Log a debug-level message (handlers, notifications).
-Arguments are not evaluated if debug logging is disabled."
-  `(when (flit--log-level-p 'debug)
-     (let ((flit--log-level-context 'debug))
-       (flit--log ,format-string ,@args))))
-
-(defmacro flit--log-trace (format-string &rest args)
-  "Log a trace-level message (cache ops, very verbose).
-Arguments are not evaluated if trace logging is disabled."
-  `(when (flit--log-level-p 'trace)
-     (let ((flit--log-level-context 'trace))
-       (flit--log ,format-string ,@args))))
-
-(defmacro flit--log-error (format-string &rest args)
-  "Log an error message (always logged regardless of level)."
-  `(flit--log (concat "ERROR: " ,format-string) ,@args))
-
-(defun flit--sanitize-params-for-log (params)
-  "Return a copy of PARAMS with large :content values truncated for logging."
-  (let ((content (plist-get params :content)))
-    (if (and content (stringp content) (> (length content) 100))
-        (plist-put (copy-sequence params) :content
-                   (format "<%d bytes>" (length content)))
-      params)))
-
-(defun flit--simple-backtrace ()
-  "Return a simple backtrace string with just function names.
-Excludes special forms and macros to show only actual function calls."
-  (let ((frames nil)
-        (n 0))
-    (while (and (< n 60)
-                (let ((frame (backtrace-frame n)))
-                  (when frame
-                    (let ((fn (cadr frame)))
-                      (when (and fn (symbolp fn)
-                                 (not (special-form-p fn))
-                                 (not (macrop fn))
-                                 (not (string-prefix-p "flit--log" (symbol-name fn)))
-                                 (not (string-prefix-p "flit--simple" (symbol-name fn))))
-                        (push (symbol-name fn) frames)))
-                    t)))
-      (cl-incf n))
-    (string-join (nreverse frames) " <- ")))
-
-(defmacro flit--with-quit-log (desc &rest body)
-  "Execute BODY.  If interrupted by C-g, log DESC with backtrace, then re-quit."
-  (declare (indent 1))
-  `(condition-case nil
-       (progn ,@body)
-     (quit
-      (flit--log-info "C-g interrupted: %s\n  backtrace: %s"
-                      ,desc (flit--simple-backtrace))
-      (signal 'quit nil))))
-
 ;;; Caching
 ;;
 ;; We use a single unified cache keyed by (host . path).
@@ -771,7 +806,7 @@ Returns alist of (host . plist) where plist has:
     (maphash
      (lambda (key value)
        (let* ((host (car key))
-              (path (cdr key))
+              (_path (cdr key))
               (is-dir (plist-get value :children))
               (s (or (gethash host stats)
                      (puthash host (list :files 0 :dirs 0 :file-bytes 0 :dir-bytes 0) stats)))
@@ -1096,7 +1131,7 @@ eldoc, flymake, and flycheck."
                    ((processp process) process)
                    ((stringp process) (get-process process))
                    (t nil)))
-            (_is-flit (process-get proc 'flit-proc-id)))
+            ((process-get proc 'flit-proc-id)))
       ;; This is a flit process - send SIGKILL if valid, then always clean up
       (progn
         (when-let* ((proc-id (flit--process-valid-for-rpc-p proc "kill"))
@@ -1107,7 +1142,7 @@ eldoc, flymake, and flycheck."
             (error nil)))
         ;; Clean up stderr process if one exists
         (when-let* ((stderr-proc (process-get proc 'flit-stderr-proc))
-                    (_live (process-live-p stderr-proc)))
+                    ((process-live-p stderr-proc)))
           (delete-process stderr-proc))
         ;; Always clean up local state
         (process-put proc 'flit-exited t)
@@ -1239,7 +1274,7 @@ Returns `connected', `connecting', `pending', `failed', or `disconnected'.
   (puthash host state flit--connection-states)
   (flit--log-info "Connection state for %s: %s" host state))
 
-(defun flit--set-connection-failed (host error-msg)
+(defun flit--set-connection-failed (host _error-msg)
   "Set connection state for HOST to `failed'.
 ERROR-MSG is logged but does not affect the state."
   (flit--set-connection-state host 'failed))
@@ -1780,7 +1815,7 @@ All parameters are captured in the closure."
 (defun flit--hs-deploying (host callback)
   "Return a handler closure for the deploying handshake state.
 Only handles terminal signals; the deploy handler does the actual work."
-  (lambda (proc json-obj _line)
+  (lambda (proc json-obj line)
     (cond
      ((and json-obj (plist-get json-obj :flit_ready))
       (flit--log-info "handshake[%s]: flit_ready received (deploying)" host)
@@ -1791,7 +1826,7 @@ Only handles terminal signals; the deploy handler does the actual work."
       (flit--sm-complete proc callback))
 
      (t
-      (flit--log-info "handshake[%s]: unrecognized (deploying): %S" host _line)))))
+      (flit--log-info "handshake[%s]: unrecognized (deploying): %S" host line)))))
 
 ;;; Handshake setup
 
@@ -2473,7 +2508,7 @@ PARAMS contains :procId and :exitCode."
   (process-put proc 'flit-exit-code exit-code)
   ;; Clean up stderr process if one exists
   (when-let* ((stderr-proc (process-get proc 'flit-stderr-proc))
-              (_live (process-live-p stderr-proc)))
+              ((process-live-p stderr-proc)))
     (delete-process stderr-proc))
   ;; Call the sentinel with the appropriate event string
   ;; Note: process-live-p may return nil for our fake pipe processes,
@@ -2663,9 +2698,11 @@ Uses cached content if available, otherwise fetches via fs/read."
 
 (defun flit--write (filename content &optional expected-mtime)
   "Write CONTENT to FILENAME and update cache.
-EXPECTED-MTIME is the mtime we expect the file to have (from visited-file-modtime).
+EXPECTED-MTIME is the mtime we expect the file to have
+\(from visited-file-modtime).
 If nil or 0, we expect the file to not exist (new file).
-If the file's actual state doesn't match, prompts user before overwriting."
+If the file's actual state doesn't match, prompts user before
+overwriting."
   (flit--with-parsed (host path) filename
     ;; Encode using buffer's coding system before base64 - base64-encode-string requires unibyte
     ;; If coding system is undecided or nil, use UTF-8
@@ -4168,6 +4205,14 @@ Called from `lsp-mode-hook' when lsp-mode activates in a buffer."
   ;; Also prefetch when new connections are established (if lsp session exists)
   (flit-run-after-connect #'flit--maybe-prefetch-lsp-workspace-folders))
 
+(defvar-local flit--desktop-restore-fn nil
+  "Saved function to call during deferred rehydration.
+This is a lambda that captures the original desktop-create-buffer and its args.")
+
+(defvar-local flit--desktop-saved-args nil
+  "Original desktop-create-buffer args for this deferred buffer.
+Used when re-saving so we preserve the original mode, not flit-deferred-mode.")
+
 (defun flit--desktop-save-buffer (_desktop-dirname)
   "Return state to save for current flit buffer.
 For deferred buffers, includes the original desktop args so we can
@@ -4360,14 +4405,6 @@ Does NOT attempt to connect - only loads if connection is already established."
 
 (defvar flit--desktop-restoring nil
   "Non-nil while desktop is restoring buffers. Used to prevent auth prompts.")
-
-(defvar-local flit--desktop-restore-fn nil
-  "Saved function to call during deferred rehydration.
-This is a lambda that captures the original desktop-create-buffer and its args.")
-
-(defvar-local flit--desktop-saved-args nil
-  "Original desktop-create-buffer args for this deferred buffer.
-Used when re-saving so we preserve the original mode, not flit-deferred-mode.")
 
 (with-eval-after-load 'desktop
   ;; Advise desktop-create-buffer to defer entire restoration for flit paths
@@ -4932,9 +4969,7 @@ Delegates to our start-file-process handler."
 (defun flit--rfn-eshadow-update-overlay ()
   "Update `flit--rfn-eshadow-overlay' — only shadow the local path part."
   (ignore-errors
-    (let ((end (or (overlay-end rfn-eshadow-overlay)
-                   (minibuffer-prompt-end)))
-          (input (buffer-substring (minibuffer-prompt-end) (point-max))))
+    (let ((input (buffer-substring (minibuffer-prompt-end) (point-max))))
       (when (and (flit--file-name-p input)
                  (flit--find-path-start input))
         (let ((path-start (+ (minibuffer-prompt-end) (flit--find-path-start input))))
@@ -4992,7 +5027,7 @@ Returns a plist with :tunnel-id and :remote-port."
       (list :tunnel-id tunnel-id :remote-port remote-port))))
 
 (defun flit-tunnel-listen (host local-port remote-port &optional tunnel-id)
-  "Start a forward tunnel that listens on LOCAL-PORT and forwards to REMOTE-PORT on HOST.
+  "Listen on LOCAL-PORT, forwarding to REMOTE-PORT on HOST.
 TUNNEL-ID is an optional unique identifier for the tunnel.
 Returns a plist with :tunnel-id and :local-port."
   (let* ((tunnel-id (or tunnel-id (format "tunnel-%s-%d-%d" host local-port remote-port)))

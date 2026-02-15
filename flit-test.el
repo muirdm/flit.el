@@ -18,6 +18,11 @@
 (require 'ert)
 (require 'flit)
 
+(declare-function flit--desktop-create-buffer-advice "flit")
+(declare-function flit--resize-process "flit")
+(defvar flit--desktop-restoring)
+(defvar tramp-backup-directory-alist)
+
 ;;; Test infrastructure
 
 (defvar flit-test--temp-dir nil
@@ -908,7 +913,7 @@ Must be called with the target buffer current."
            (buf (generate-new-buffer " *test-async-env*")))
       ;; First, establish the connection by doing a file operation
       ;; This starts the flit-server
-      (file-exists-p default-directory)
+      (ignore (file-exists-p default-directory))
       ;; NOW set a "default" env var - server already started, won't inherit it
       ;; But since it's set with setenv (not let-bound), it goes into default-toplevel-value
       ;; and should NOT be sent in the delta
@@ -1656,8 +1661,7 @@ buffer in an unmodified state even though content differed from disk."
   (flit-test--with-fixture
     (let* ((path (flit-test--path "revert-test.txt"))
            (local-path (flit-test--local-path "revert-test.txt"))
-           buf
-           saved-content)
+           buf)
       ;; Create file with initial content
       (flit-test--create-file "revert-test.txt" "original content")
       (sleep-for 0.1)
@@ -1681,9 +1685,8 @@ buffer in an unmodified state even though content differed from disk."
             (insert " - edited")
             (should (buffer-modified-p))
 
-            ;; Save the file and remember what we saved
+            ;; Save the file
             (save-buffer)
-            (setq saved-content (buffer-string))
             (should-not (buffer-modified-p))
 
             ;; Wait >1 second for mtime to change (mtime has second granularity)
@@ -1725,7 +1728,7 @@ buffer in an unmodified state even though content differed from disk."
 (ert-deftest flit-test-set-file-modes ()
   "Test set-file-modes changes permissions."
   (flit-test--with-fixture
-    (let* ((path (flit-test--create-file "chmod-test.txt" "test content"))
+    (let* ((_path (flit-test--create-file "chmod-test.txt" "test content"))
            (flit-path (flit-test--path "chmod-test.txt")))
       ;; Set to read-only
       (set-file-modes flit-path #o444)
@@ -1740,9 +1743,9 @@ buffer in an unmodified state even though content differed from disk."
 (ert-deftest flit-test-set-file-times ()
   "Test set-file-times changes modification time."
   (flit-test--with-fixture
-    (let* ((path (flit-test--create-file "touch-test.txt" "test content"))
+    (let* ((_path (flit-test--create-file "touch-test.txt" "test content"))
            (flit-path (flit-test--path "touch-test.txt"))
-           (old-time (file-attribute-modification-time
+           (_old-time (file-attribute-modification-time
                       (file-attributes flit-path)))
            ;; Set to a specific time (2020-01-01 00:00:00)
            (new-time (encode-time 0 0 0 1 1 2020)))
@@ -1757,7 +1760,7 @@ buffer in an unmodified state even though content differed from disk."
   "Test file-local-copy creates a local temp file."
   (flit-test--with-fixture
     (let* ((content "content for local copy")
-           (path (flit-test--create-file "local-copy.txt" content))
+           (_path (flit-test--create-file "local-copy.txt" content))
            (flit-path (flit-test--path "local-copy.txt"))
            (local-copy (file-local-copy flit-path)))
       (unwind-protect
@@ -1819,7 +1822,7 @@ buffer in an unmodified state even though content differed from disk."
       (should-error (access-file flit-path "testing access")
                     :type 'file-error))
     ;; Should not signal for existing file
-    (let* ((path (flit-test--create-file "exists.txt" "content"))
+    (let* ((_path (flit-test--create-file "exists.txt" "content"))
            (flit-path (flit-test--path "exists.txt")))
       (should-not (access-file flit-path "testing access")))))
 
@@ -2114,7 +2117,7 @@ buffer in an unmodified state even though content differed from disk."
              (result (jsonrpc-request conn "fs/info" `(:path ,path))))
         ;; Log the result keys for debugging
         (message "Raw fs/info result keys: %S"
-                 (cl-loop for (k v) on result by #'cddr collect k))
+                 (cl-loop for (k _v) on result by #'cddr collect k))
         (message "Raw fs/info :children = %S" (plist-get result :children))
         ;; Check the raw response has children
         (should (plist-get result :exists))
