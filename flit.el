@@ -18,7 +18,7 @@
 ;; Copyright (C) 2025
 ;; Author: Muir Manders
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "28.1"))
+;; Package-Requires: ((emacs "30.1"))
 ;; Keywords: files, remote, tools
 ;; URL: https://github.com/muirdm/flit.el
 

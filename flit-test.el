@@ -19,7 +19,6 @@
 (require 'flit)
 
 (declare-function flit--desktop-create-buffer-advice "flit")
-(declare-function flit--resize-process "flit")
 (defvar flit--desktop-restoring)
 (defvar tramp-backup-directory-alist)
 
@@ -787,7 +786,7 @@ Must be called with the target buffer current."
           (progn
             (set-process-buffer proc buf)
             ;; Resize should not error
-            (flit--resize-process proc 40 120)
+            (set-process-window-size proc 40 120)
             ;; Give a moment for the async request
             (let ((conn (gethash "test" flit--connections)))
               (when conn
