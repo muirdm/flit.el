@@ -1571,7 +1571,7 @@ the final connection with `flit--make-connection'."
 
 (defvar flit--source-directory
   (let ((lisp-dir (file-name-directory (or load-file-name buffer-file-name ""))))
-    (expand-file-name "server" (file-name-directory (directory-file-name lisp-dir))))
+    (expand-file-name "server" lisp-dir))
   "Directory containing the flit Go source code.")
 
 (defun flit--uname-to-goos (name)
