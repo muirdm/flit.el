@@ -2277,7 +2277,14 @@ Emacs expects raw paths from exec-path and adds the remote prefix itself."
   ;; Skip logging exec/output and log - too noisy, use flit-log-events for RPC details
   (unless (memq method '(exec/output log))
     (flit--log-debug "Notification: %s %S" method params))
-  (let ((start-time (float-time)))
+  ;; Reset non-essential so that RPCs triggered by notification handlers
+  ;; (e.g. isle-refresh from exec/output) aren't cancelled by the
+  ;; cancel-on-input binding of whatever outer context (auto-revert, etc.)
+  ;; happens to be waiting on the jsonrpc connection.
+  (let ((start-time (float-time))
+        ;; Unset non-essential so our jsonrpc cancel-on-input logic doesn't fire for
+        ;; unlocky notification handlers.
+        (non-essential nil))
     (cond
      ((eq method 'fs/changed)
       (flit--handle-file-changed conn params))
