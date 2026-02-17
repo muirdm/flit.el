@@ -57,6 +57,8 @@
 (declare-function flit--lsp-mode-hook "flit")
 (declare-function flit--maybe-prefetch-lsp-workspace-folders "flit")
 (declare-function flit--prefetch-lsp-workspace-folders "flit")
+(declare-function comint-output-filter "comint")
+(declare-function shell-command-sentinel "simple")
 
 ;; Forward declarations for variables from external packages.
 (defvar savehist-additional-variables)
@@ -3115,7 +3117,8 @@ Also marks buffers as potentially stale to trigger revert check."
     file-truename write-region
     lock-file unlock-file make-auto-save-file-name start-file-process
     process-file file-name-completion file-name-all-completions
-    file-newer-than-file-p make-process exec-path)
+    file-newer-than-file-p make-process exec-path
+    shell-command)
   "Operations where the filename isn't simply the first argument.")
 
 (defvar flit--current-path nil
@@ -4071,6 +4074,113 @@ Also marks buffers as potentially stale to trigger revert check."
                             (insert stderr))))))))
                   exit-code))
             (flit--call-default operation args))))
+
+       ((eq operation 'shell-command)
+        (let* ((command (car args))
+               (output-buffer (nth 1 args))
+               (error-buffer (nth 2 args))
+               (async-pos (string-match "&[ \t]*\\'" command))
+               (asynchronous async-pos)
+               (command (if asynchronous
+                            (substring command 0 async-pos)
+                          command))
+               (current-buffer-p nil)
+               (output-buffer
+                (cond
+                 ((bufferp output-buffer)
+                  (setq current-buffer-p (eq (current-buffer) output-buffer))
+                  output-buffer)
+                 ((stringp output-buffer)
+                  (setq current-buffer-p
+                        (eq (buffer-name (current-buffer)) output-buffer))
+                  (get-buffer-create output-buffer))
+                 (output-buffer
+                  (setq current-buffer-p t)
+                  (current-buffer))
+                 (t (get-buffer-create
+                     (if asynchronous
+                         shell-command-buffer-name-async
+                       shell-command-buffer-name)))))
+               (error-buffer
+                (cond
+                 ((bufferp error-buffer) error-buffer)
+                 ((stringp error-buffer) (get-buffer-create error-buffer))))
+               (buffer (if error-buffer
+                           ;; error-buffer not supported for remote error
+                           ;; separation; just merge stderr into output.
+                           output-buffer
+                         output-buffer))
+               (bname (buffer-name output-buffer))
+               (proc (get-buffer-process output-buffer)))
+          ;; Handle existing async process in output buffer.
+          (when (and asynchronous proc)
+            (cond
+             ((eq async-shell-command-buffer 'confirm-kill-process)
+              (if (yes-or-no-p
+                   "A command is running in the default buffer.  Kill it? ")
+                  (kill-process proc)
+                (user-error "Shell command in progress")))
+             ((eq async-shell-command-buffer 'confirm-new-buffer)
+              (if (yes-or-no-p
+                   "A command is running in the default buffer.  Use a new buffer? ")
+                  (setq output-buffer (generate-new-buffer bname))
+                (user-error "Shell command in progress")))
+             ((eq async-shell-command-buffer 'new-buffer)
+              (setq output-buffer (generate-new-buffer bname)))
+             ((eq async-shell-command-buffer 'confirm-rename-buffer)
+              (if (yes-or-no-p
+                   "A command is running in the default buffer.  Rename it? ")
+                  (progn
+                    (with-current-buffer output-buffer
+                      (rename-uniquely))
+                    (setq output-buffer (get-buffer-create bname)))
+                (user-error "Shell command in progress")))
+             ((eq async-shell-command-buffer 'rename-buffer)
+              (with-current-buffer output-buffer
+                (rename-uniquely))
+              (setq output-buffer (get-buffer-create bname)))))
+          (with-current-buffer output-buffer
+            (when current-buffer-p
+              (barf-if-buffer-read-only)
+              (push-mark nil t))
+            (shell-command-save-pos-or-erase current-buffer-p))
+          (if asynchronous
+              (let* ((proc (start-file-process-shell-command
+                            (buffer-name output-buffer) buffer command)))
+                (when (process-live-p proc)
+                  (process-put proc 'remote-command
+                               (list shell-file-name shell-command-switch command))
+                  (with-current-buffer output-buffer
+                    (setq mode-line-process '(":%s"))
+                    (require 'shell)
+                    (unless (eq major-mode async-shell-command-mode)
+                      (funcall async-shell-command-mode))
+                    (set-process-filter proc #'comint-output-filter)
+                    (set-process-sentinel proc #'shell-command-sentinel)
+                    (if async-shell-command-display-buffer
+                        (display-buffer output-buffer '(nil (allow-no-window . t)))
+                      (let ((nonce (make-symbol "nonce")))
+                        (add-function
+                         :before (process-filter proc)
+                         (lambda (proc _string)
+                           (let ((buf (process-buffer proc)))
+                             (when (buffer-live-p buf)
+                               (remove-function (process-filter proc) nonce)
+                               (display-buffer buf '(nil (allow-no-window . t))))))
+                         `((name . ,nonce)))))))
+                proc)
+            ;; Synchronous.
+            (prog1
+                (process-file-shell-command command nil buffer)
+              (if current-buffer-p
+                  (progn
+                    (goto-char (prog1 (mark t)
+                                 (set-marker (mark-marker) (point)
+                                             (current-buffer))))
+                    (shell-command-set-point-after-cmd))
+                (when (with-current-buffer output-buffer
+                        (> (point-max) (point-min)))
+                  (display-message-or-buffer output-buffer)))))))
 
        ;; exec-path - return remote PATH directories
        ;; Called with nil args, use default-directory to get host

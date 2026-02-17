@@ -2425,6 +2425,72 @@ file changes should be reflected in the buffer."
         (ignore-errors (flit--unwatch (buffer-file-name buf)))
         (kill-buffer buf)))))
 
+;;; shell-command tests
+
+(ert-deftest flit-test-shell-command-sync ()
+  "Test synchronous shell-command on remote host."
+  (flit-test--with-fixture
+    (let ((default-directory (flit-test--path "")))
+      (with-temp-buffer
+        (shell-command "echo hello" (current-buffer))
+        (should (string-match-p "hello" (buffer-string)))))))
+
+(ert-deftest flit-test-shell-command-sync-exit-code ()
+  "Test synchronous shell-command returns output from remote."
+  (flit-test--with-fixture
+    (flit-test--create-file "testfile.txt" "file content here")
+    (let ((default-directory (flit-test--path "")))
+      (with-temp-buffer
+        (shell-command "cat testfile.txt" (current-buffer))
+        (should (string-match-p "file content here" (buffer-string)))))))
+
+(ert-deftest flit-test-shell-command-sync-cwd ()
+  "Test synchronous shell-command runs in correct directory."
+  (flit-test--with-fixture
+    (make-directory (flit-test--local-path "shelldir"))
+    (let ((default-directory (flit-test--path "shelldir/")))
+      (with-temp-buffer
+        (shell-command "pwd" (current-buffer))
+        (should (string-match-p "shelldir" (buffer-string)))))))
+
+(ert-deftest flit-test-shell-command-sync-pipeline ()
+  "Test synchronous shell-command with a pipeline."
+  (flit-test--with-fixture
+    (let ((default-directory (flit-test--path "")))
+      (with-temp-buffer
+        (shell-command "echo 'abc def ghi' | tr ' ' '\\n' | sort -r" (current-buffer))
+        (should (string-match-p "ghi" (buffer-string)))
+        (should (string-match-p "abc" (buffer-string)))))))
+
+(ert-deftest flit-test-shell-command-async ()
+  "Test asynchronous shell-command on remote host."
+  (flit-test--with-fixture
+    (let* ((default-directory (flit-test--path ""))
+           (buf (generate-new-buffer " *test-shell-async*")))
+      (unwind-protect
+          (progn
+            (shell-command "echo async-output &" buf)
+            ;; Wait for output
+            (let ((conn (gethash "test" flit--connections))
+                  (start (float-time)))
+              (while (and (< (- (float-time) start) 5)
+                          (with-current-buffer buf
+                            (not (string-match-p "async-output" (buffer-string)))))
+                (when conn
+                  (accept-process-output (jsonrpc--process conn) 0.1))))
+            (with-current-buffer buf
+              (should (string-match-p "async-output" (buffer-string)))))
+        (when-let* ((proc (get-buffer-process buf)))
+          (delete-process proc))
+        (kill-buffer buf)))))
+
+(ert-deftest flit-test-shell-command-to-string ()
+  "Test shell-command-to-string on remote host."
+  (flit-test--with-fixture
+    (let ((default-directory (flit-test--path "")))
+      (should (string-match-p "hello"
+                              (shell-command-to-string "echo hello"))))))
+
 ;;; Provide
 
 (provide 'flit-test)
