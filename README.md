@@ -36,9 +36,11 @@ To compile the flit binary, you must have Go installed on your local host.
 
 ## Warnings
 
-This is AI slop. There are bugs, including potential data loss. There will be breaking changes to the public interface.
+There are bugs, including potential data loss if something really goes wrong. That being said, I daily drive it and haven't had issues.
 
-Security is up to you. The flit server allows arbitrary command execution and filesystem operations over JSON-RPC with no authentication. I recommend piggy backing on your existing ET or SSH auth setup.
+The flit server allows arbitrary command execution and filesystem operations over JSON-RPC with no authentication. I recommend only using the :et or :ssh connection methods, piggy backing on your existing authentication setup. The flit server is run in "oneshot" mode talking over stdio to Emacs. I am not a security expert, but this doesn't seem worse than TRAMP. Please open an issue if you have security advice.
+
+There will almost certainly be breaking changes to the public interface.
 
 ## Architecture
 
