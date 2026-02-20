@@ -65,13 +65,14 @@ func GetEdenRoot(path string) string {
 	for {
 		edenDir := filepath.Join(dir, ".eden")
 		if info, err := os.Stat(edenDir); err == nil && info.IsDir() {
-			// Found .eden directory, read the root symlink
+			// Found .eden directory, read the root symlink.
+			// In a real Eden mount, .eden/root is a symlink to the mount root.
+			// If it's not a symlink (e.g. gvfs FUSE mounts respond to stat
+			// for any path), this isn't Eden — keep walking up.
 			rootLink := filepath.Join(edenDir, "root")
 			if target, err := os.Readlink(rootLink); err == nil {
 				return target
 			}
-			// If we can't read the symlink, use the parent of .eden
-			return dir
 		}
 
 		parent := filepath.Dir(dir)
