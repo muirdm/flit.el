@@ -4454,57 +4454,68 @@ The buffer will attempt to load the file when switched to."
 (defun flit--load-deferred-buffer ()
   "Load the current deferred buffer's file content.
 Assumes connection is already established. Returns t on success, nil on failure."
-  (condition-case err
-      (let ((file-name buffer-file-name)
-            (restore-fn flit--desktop-restore-fn)
-            (old-buffer (current-buffer)))
-        (remhash buffer-file-name flit--deferred-buffers)
-        (remove-hook 'window-buffer-change-functions
-                     #'flit--maybe-load-deferred-buffer t)
-        (remove-hook 'window-selection-change-functions
-                     #'flit--maybe-load-deferred-buffer t)
-        (if restore-fn
-            ;; Desktop restore - call saved restore function
-            ;; Rename deferred buffer so desktop-create-buffer creates fresh,
-            ;; then swap windows to avoid jarring buffer switch
-            (let ((windows (get-buffer-window-list old-buffer nil t)))
-              ;; Rename so find-buffer-visiting won't return it
-              (with-current-buffer old-buffer
-                (setq buffer-file-name nil)
-                (rename-buffer (concat " *flit-rehydrating*" (buffer-name)) t))
-              ;; Bind variables that desktop-create-buffer expects from desktop-read
-              (let* ((desktop-first-buffer nil)
-                     (desktop-buffer-ok-count 0)
-                     (desktop-buffer-fail-count 0)
-                     (desktop-save nil)
-                     (new-buf (funcall restore-fn)))
-                (flit--log-info "Rehydrated %s via desktop-create-buffer" file-name)
-                ;; Replace old buffer with new in all windows
-                (dolist (win windows)
-                  (when (window-live-p win)
-                    (set-window-buffer win new-buf)))
-                ;; Now safe to kill the old buffer
-                (kill-buffer old-buffer)
-                (with-current-buffer new-buf
-                  (flit--setup-file-watch)
-                  (message "[flit] Loaded %s" file-name)
-                  (redisplay t))))
-          ;; Non-desktop case - load content directly
-          (let ((inhibit-read-only t))
-            (erase-buffer)
-            (insert-file-contents file-name t)
-            (kill-local-variable 'revert-buffer-function)
-            (after-find-file nil nil t nil nil)
-            (flit--setup-file-watch)
-            (message "[flit] Loaded %s" file-name)
-            (redisplay t)))
-        t)
+  (let ((file-name buffer-file-name)
+        (restore-fn flit--desktop-restore-fn)
+        (old-buffer (current-buffer)))
+    (condition-case err
+        (progn
+          (remhash buffer-file-name flit--deferred-buffers)
+          (remove-hook 'window-buffer-change-functions
+                       #'flit--maybe-load-deferred-buffer t)
+          (remove-hook 'window-selection-change-functions
+                       #'flit--maybe-load-deferred-buffer t)
+          (if restore-fn
+              ;; Desktop restore - call saved restore function
+              ;; Rename deferred buffer so desktop-create-buffer creates fresh,
+              ;; then swap windows to avoid jarring buffer switch
+              (let ((windows (get-buffer-window-list old-buffer nil t)))
+                ;; Rename so find-buffer-visiting won't return it
+                (with-current-buffer old-buffer
+                  (setq buffer-file-name nil)
+                  (rename-buffer (concat " *flit-rehydrating*" (buffer-name)) t))
+                ;; Bind variables that desktop-create-buffer expects from desktop-read
+                (let* ((desktop-first-buffer nil)
+                       (desktop-buffer-ok-count 0)
+                       (desktop-buffer-fail-count 0)
+                       (desktop-save nil)
+                       (new-buf (funcall restore-fn)))
+                  (flit--log-info "Rehydrated %s via desktop-create-buffer" file-name)
+                  ;; Replace old buffer with new in all windows
+                  (dolist (win windows)
+                    (when (window-live-p win)
+                      (set-window-buffer win new-buf)))
+                  ;; Now safe to kill the old buffer
+                  (kill-buffer old-buffer)
+                  (with-current-buffer new-buf
+                    (flit--setup-file-watch)
+                    (message "[flit] Loaded %s" file-name)
+                    (redisplay t))))
+            ;; Non-desktop case - load content directly
+            (let ((inhibit-read-only t))
+              (erase-buffer)
+              (insert-file-contents file-name t)
+              (kill-local-variable 'revert-buffer-function)
+              (after-find-file nil nil t nil nil)
+              (flit--setup-file-watch)
+              (message "[flit] Loaded %s" file-name)
+              (redisplay t)))
+          t)
     (error
-     ;; Re-add to deferred list and update display
-     (puthash buffer-file-name t flit--deferred-buffers)
-     (flit--update-deferred-buffer-content)
-     (message "[flit] Failed to load %s: %s" buffer-file-name (error-message-string err))
-     nil)))
+     ;; Turn into an empty buffer visiting the file path, like
+     ;; find-file on a nonexistent file.  Use file-name since the
+     ;; desktop restore path sets buffer-file-name to nil.
+     (when restore-fn
+       ;; Undo the desktop restore rename
+       (rename-buffer (file-name-nondirectory file-name) t))
+     (setq buffer-file-name file-name)
+     (remhash file-name flit--deferred-buffers)
+     (let ((inhibit-read-only t))
+       (erase-buffer))
+     (kill-local-variable 'revert-buffer-function)
+     (flit-deferred-mode -1)
+     (after-find-file nil nil t nil nil)
+     (message "[flit] Failed to load %s: %s" file-name (error-message-string err))
+     nil))))
 
 (defun flit--maybe-load-deferred-buffer (_frame-or-window)
   "Load a deferred buffer if already connected, or ensure point is at start.
