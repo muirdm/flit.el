@@ -2274,21 +2274,8 @@ Emacs expects raw paths from exec-path and adds the remote prefix itself."
       (let ((path (plist-get sys-info :path)))
         (append path nil)))))
 
-(defvar flit--in-sync-request nil
-  "Non-nil when a synchronous JSON-RPC request is in progress.
-Notification handlers are deferred via `run-with-idle-timer' to
-prevent them from starving the pending response.")
-
 (defun flit--handle-notification (conn method params)
-  "Handle a server notification METHOD with PARAMS from CONN.
-When a synchronous request is in progress, defers handling until
-Emacs is idle to avoid blocking the response."
-  (if flit--in-sync-request
-      (run-with-idle-timer 0 nil #'flit--handle-notification-1 conn method params)
-    (flit--handle-notification-1 conn method params)))
-
-(defun flit--handle-notification-1 (conn method params)
-  "Actually handle a server notification METHOD with PARAMS from CONN."
+  "Handle a server notification METHOD with PARAMS from CONN."
   ;; Skip logging exec/output and log - too noisy, use flit-log-events for RPC details
   (unless (memq method '(exec/output log))
     (flit--log-debug "Notification: %s %S" method params))
@@ -2599,8 +2586,7 @@ Returns the result or signals an error."
     (unless conn
       (error "Cannot connect to flit-server on %s" host))
     (let* ((start-time (float-time))
-           (cancelable non-essential)
-           (flit--in-sync-request t))
+           (cancelable non-essential))
       (condition-case err
           (let ((result (jsonrpc-request conn method params
                                          :timeout (or timeout flit-timeout)
