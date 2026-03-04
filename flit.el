@@ -1921,7 +1921,9 @@ SSH-ARGS is the base SSH args for the pty-bridge fallback."
                          (lambda (result-proc error-msg)
                            (if error-msg
                                (flit--ssh-fallback host ssh-args callback method-chain)
-                             (funcall callback result-proc nil)))
+                             (process-put result-proc 'flit-method
+                                          (string-join (reverse (cons "ssh" method-chain)) " → "))
+                             (funcall callback (flit--make-connection host result-proc) nil)))
                          :handle-password nil
                          :deploy-handler
                          (lambda (_host deploy-proc _json-obj _callback)
