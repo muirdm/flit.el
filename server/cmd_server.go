@@ -24,6 +24,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -86,6 +87,22 @@ Options:`)
 		timeout = 0
 	}
 	srv := server.New(timeout, *verbose, level)
+
+	// Dump goroutine stacks on SIGUSR1 for debugging hangs
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGUSR1)
+		for range sigCh {
+			buf := make([]byte, 64*1024*1024) // 64MB should be enough
+			n := runtime.Stack(buf, true)      // true = all goroutines
+			path := fmt.Sprintf("/tmp/flit-goroutines.%d.txt", os.Getpid())
+			if err := os.WriteFile(path, buf[:n], 0644); err != nil {
+				slog.Error("Failed to write goroutine dump", "error", err)
+			} else {
+				slog.Info("Wrote goroutine dump", "path", path, "bytes", n)
+			}
+		}
+	}()
 
 	// Handle stdio mode
 	if *stdio {
