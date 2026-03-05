@@ -1082,9 +1082,9 @@ process receives output, or until timeout expires."
 (advice-add 'accept-process-output :around #'flit--accept-process-output-advice)
 
 (defun flit--non-essential-advice (orig-fn &rest args)
-  "Bind `non-essential' to t so flit RPCs can be cancelled on user input.
+  "Bind `non-essential' to t so flit uses passive connection tier.
 Used as :around advice for timer-driven functions like auto-revert,
-eldoc, flymake, and flycheck."
+eldoc, flymake, and flycheck to prevent them from initiating new connections."
   (let ((non-essential t))
     (apply orig-fn args)))
 
@@ -1457,15 +1457,21 @@ Defaults to `passive' when `flit--connection-tier' is unbound.
 
 (defun flit--make-connection (host proc)
   "Create a flit-connection for HOST using PROC."
-  (make-instance
-   'flit-connection
-   :name (process-name proc)
-   :process proc
-   :host host
-   :events-buffer-config (flit--events-buffer-config)
-   :notification-dispatcher #'flit--handle-notification
-   :request-dispatcher #'flit--handle-request
-   :on-shutdown (flit--on-shutdown host)))
+  (let ((conn (make-instance
+               'flit-connection
+               :name (process-name proc)
+               :process proc
+               :host host
+               :events-buffer-config (flit--events-buffer-config)
+               :notification-dispatcher #'flit--handle-notification
+               :request-dispatcher #'flit--handle-request
+               :on-shutdown (flit--on-shutdown host))))
+    ;; Increase read chunk size so Emacs drains the pipe faster, reducing
+    ;; backpressure on large responses/notifications (default is often 4KB).
+    (when-let ((buf (process-buffer proc)))
+      (with-current-buffer buf
+        (setq-local read-process-output-max (* 1024 1024))))
+    conn))
 
 ;;; Connection type: :stdio
 
@@ -2281,14 +2287,7 @@ Emacs expects raw paths from exec-path and adds the remote prefix itself."
   ;; Skip logging exec/output and log - too noisy, use flit-log-events for RPC details
   (unless (memq method '(exec/output log))
     (flit--log-debug "Notification: %s %S" method params))
-  ;; Reset non-essential so that RPCs triggered by notification handlers
-  ;; (e.g. isle-refresh from exec/output) aren't cancelled by the
-  ;; cancel-on-input binding of whatever outer context (auto-revert, etc.)
-  ;; happens to be waiting on the jsonrpc connection.
-  (let ((start-time (float-time))
-        ;; Unset non-essential so our jsonrpc cancel-on-input logic doesn't fire for
-        ;; unlocky notification handlers.
-        (non-essential nil))
+  (let ((start-time (float-time)))
     (cond
      ((eq method 'fs/changed)
       (flit--handle-file-changed conn params))
@@ -2581,29 +2580,19 @@ If so, log the stuck data to help diagnose hangs."
   "Send a JSON-RPC request to HOST and wait for response.
 METHOD is the RPC method name, PARAMS is a plist of parameters.
 TIMEOUT is optional seconds to wait (default `flit-timeout').
-When `non-essential' is non-nil, the request is cancelled if the user
-types input, and this function returns nil.
 Returns the result or signals an error."
   (let ((conn (flit--get-connection host)))
     (unless conn
       (error "Cannot connect to flit-server on %s" host))
-    (let* ((start-time (float-time))
-           (cancelable non-essential))
+    (let* ((start-time (float-time)))
       (condition-case err
           (let ((result (jsonrpc-request conn method params
-                                         :timeout (or timeout flit-timeout)
-                                         :cancel-on-input cancelable
-                                         :cancel-on-input-retval 'flit--cancelled)))
-            (if (eq result 'flit--cancelled)
-                (progn
-                  (flit--log-info "RPC %s cancelled (user input) after %.3fs"
-                                  method (- (float-time) start-time))
-                  nil)
-              (flit--log-info "RPC %s %S -> %.3fs%s"
-                              method (flit--sanitize-params-for-log params)
-                              (- (float-time) start-time)
-                              (flit--format-rpc-result-extra method result))
-              result))
+                                         :timeout (or timeout flit-timeout))))
+            (flit--log-info "RPC %s %S -> %.3fs%s"
+                            method (flit--sanitize-params-for-log params)
+                            (- (float-time) start-time)
+                            (flit--format-rpc-result-extra method result))
+            result)
         (jsonrpc-error
          (flit--log-error "RPC %s %S -> ERROR after %.3fs: %S"
                           method (flit--sanitize-params-for-log params)
@@ -4514,7 +4503,7 @@ Assumes connection is already established. Returns t on success, nil on failure.
      (let ((inhibit-read-only t))
        (erase-buffer))
      (kill-local-variable 'revert-buffer-function)
-     (flit-deferred-mode -1)
+     (fundamental-mode)
      (after-find-file nil nil t nil nil)
      (message "[flit] Failed to load %s: %s" file-name (error-message-string err))
      nil))))
