@@ -211,6 +211,7 @@ func NewSession(logLevel slog.Level) *Session {
 				}
 			}
 		},
+		sess.logger,
 	)
 	return sess
 }
@@ -227,6 +228,7 @@ func (sess *Session) SetServer(srv *jrpc2.Server) {
 	// Create RPC logger that sends logs to client
 	rpcHandler := NewRPCLogHandler(sess.logLevel, notify)
 	sess.logger = slog.New(rpcHandler)
+	sess.procManager.SetLogger(sess.logger)
 	// Create tunnel manager (handles both forward and reverse tunnels)
 	sess.tunnelManager = tunnel.NewManager(notify, sess.logger)
 }

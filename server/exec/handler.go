@@ -25,6 +25,7 @@ import (
 	"os/exec"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/creack/pty"
 )
@@ -39,11 +40,18 @@ type ExitFunc func(procID string, exitCode int)
 type Process struct {
 	ID       string
 	cmd      *exec.Cmd
+	cmdName  string // command name for logging
 	stdin    io.WriteCloser
 	ptyFile  *os.File // master PTY fd, non-nil if running in PTY mode
 	ptySlave *os.File // slave PTY fd, for flow control ioctls
 	cancel   context.CancelFunc
 	mu       sync.Mutex
+
+	// Async input: inputs are queued to inputCh and written by a dedicated
+	// goroutine, so a blocked stdin write doesn't block the RPC server.
+	inputCh        chan string
+	inputClosed    bool // protected by mu, prevents send to closed channel
+	inputCloseOnce sync.Once
 
 	// Input ordering: buffer out-of-order inputs and write in sequence
 	inputExpectedIdx int64            // next expected input index
@@ -65,15 +73,22 @@ type Manager struct {
 	nextID    int
 	onOutput  OutputFunc
 	onExit    ExitFunc
+	logger    *slog.Logger
 }
 
 // NewManager creates a new process manager
-func NewManager(onOutput OutputFunc, onExit ExitFunc) *Manager {
+func NewManager(onOutput OutputFunc, onExit ExitFunc, logger *slog.Logger) *Manager {
 	return &Manager{
 		processes: make(map[string]*Process),
 		onOutput:  onOutput,
 		onExit:    onExit,
+		logger:    logger,
 	}
+}
+
+// SetLogger updates the logger used for warnings (e.g. when the RPC logger becomes available).
+func (m *Manager) SetLogger(logger *slog.Logger) {
+	m.logger = logger
 }
 
 // StartParams contains parameters for starting an async process
@@ -174,10 +189,13 @@ func (m *Manager) Start(params StartParams) (*StartResult, error) {
 		proc = &Process{
 			ID:       procID,
 			cmd:      cmd,
+			cmdName:  params.Cmd,
 			ptyFile:  ptmx,
 			ptySlave: ptySlave,
 			cancel:   cancel,
+			inputCh:  make(chan string, 1024),
 		}
+		go m.inputWriter(proc)
 
 		// Read PTY output (combined stdout/stderr)
 		var wg sync.WaitGroup
@@ -218,11 +236,14 @@ func (m *Manager) Start(params StartParams) (*StartResult, error) {
 		}
 
 		proc = &Process{
-			ID:     procID,
-			cmd:    cmd,
-			stdin:  stdin,
-			cancel: cancel,
+			ID:      procID,
+			cmd:     cmd,
+			cmdName: params.Cmd,
+			stdin:   stdin,
+			cancel:  cancel,
+			inputCh: make(chan string, 1024),
 		}
+		go m.inputWriter(proc)
 
 		// Start goroutines to read stdout/stderr
 		var wg sync.WaitGroup
@@ -287,6 +308,11 @@ func (m *Manager) waitForExitWithWg(procID string, cmd *exec.Cmd, wg *sync.WaitG
 		proc.ptySlave.Close()
 	}
 
+	// Close input channel so the writer goroutine exits
+	if proc != nil {
+		proc.closeInputCh()
+	}
+
 	// Wait for output goroutines to finish sending all data before
 	// sending exit notification - prevents race where exit arrives
 	// before final output
@@ -327,6 +353,8 @@ type InputParams struct {
 
 // Input sends data to a process's stdin (or PTY)
 // Inputs are buffered and written in order based on Idx.
+// Data is queued to a per-process channel and written by a dedicated goroutine,
+// so a blocked stdin write never blocks the RPC server.
 func (m *Manager) Input(params InputParams) error {
 	m.mu.RLock()
 	proc, exists := m.processes[params.ProcID]
@@ -339,6 +367,10 @@ func (m *Manager) Input(params InputParams) error {
 	proc.mu.Lock()
 	defer proc.mu.Unlock()
 
+	if proc.inputClosed {
+		return nil // process exiting, discard silently
+	}
+
 	// Initialize buffer on first use
 	if proc.inputBuffer == nil {
 		proc.inputBuffer = make(map[int64]string)
@@ -346,18 +378,14 @@ func (m *Manager) Input(params InputParams) error {
 
 	// Check if this is the expected input
 	if params.Idx == proc.inputExpectedIdx {
-		// Write this input and any buffered sequential ones
-		if err := proc.writeInput(params.Data); err != nil {
-			return err
-		}
+		// Queue this input and any buffered sequential ones
+		m.queueInput(proc, params.Data)
 		proc.inputExpectedIdx++
 
 		// Drain any buffered inputs that are now in sequence
 		for {
 			if data, ok := proc.inputBuffer[proc.inputExpectedIdx]; ok {
-				if err := proc.writeInput(data); err != nil {
-					return err
-				}
+				m.queueInput(proc, data)
 				proc.inputBufferSize -= len(data)
 				delete(proc.inputBuffer, proc.inputExpectedIdx)
 				proc.inputExpectedIdx++
@@ -382,6 +410,47 @@ func (m *Manager) Input(params InputParams) error {
 	// else: params.Idx < proc.inputExpectedIdx - duplicate, ignore silently
 
 	return nil
+}
+
+// queueInput sends data to the process's input channel for async writing.
+// If the channel is full (writer goroutine blocked on stdin), waits up to 5s
+// then kills the process — a corrupted input stream can't be recovered.
+// Caller must hold proc.mu.
+func (m *Manager) queueInput(proc *Process, data string) {
+	select {
+	case proc.inputCh <- data:
+		return
+	default:
+	}
+
+	// Channel full — give the process time to drain before killing it.
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case proc.inputCh <- data:
+		return
+	case <-timer.C:
+		m.logger.Warn("exec/input: stdin write blocked for 5s, killing process",
+			"procId", proc.ID, "cmd", proc.cmdName)
+		proc.inputClosed = true // caller holds proc.mu
+		proc.cancel()
+	}
+}
+
+// inputWriter is a dedicated goroutine that reads from inputCh and writes
+// to the process's stdin/PTY. This goroutine is the only writer to stdin,
+// so a blocked write only blocks this goroutine, not the RPC server.
+func (m *Manager) inputWriter(proc *Process) {
+	for data := range proc.inputCh {
+		if err := proc.writeInput(data); err != nil {
+			slog.Debug("inputWriter: write failed", "procId", proc.ID, "error", err)
+			return
+		}
+	}
+	// Channel closed - close stdin to signal EOF to the process
+	if proc.stdin != nil {
+		proc.stdin.Close()
+	}
 }
 
 // writeInput writes data to the process's stdin or PTY.
@@ -431,6 +500,17 @@ func (m *Manager) Signal(params SignalParams) error {
 	return proc.cmd.Process.Signal(sig)
 }
 
+// closeInputCh closes the input channel, signaling the writer goroutine to
+// drain remaining data and exit. Safe to call multiple times.
+func (proc *Process) closeInputCh() {
+	proc.mu.Lock()
+	proc.inputClosed = true
+	proc.mu.Unlock()
+	proc.inputCloseOnce.Do(func() {
+		close(proc.inputCh)
+	})
+}
+
 // CloseInput closes a process's stdin
 func (m *Manager) CloseInput(procID string) error {
 	m.mu.RLock()
@@ -441,16 +521,7 @@ func (m *Manager) CloseInput(procID string) error {
 		return fmt.Errorf("process not found: %s", procID)
 	}
 
-	proc.mu.Lock()
-	defer proc.mu.Unlock()
-
-	// PTY doesn't have separate stdin to close
-	if proc.ptyFile != nil {
-		return nil
-	}
-	if proc.stdin != nil {
-		return proc.stdin.Close()
-	}
+	proc.closeInputCh()
 	return nil
 }
 
@@ -504,6 +575,7 @@ func (m *Manager) Close() {
 	defer m.mu.Unlock()
 
 	for _, proc := range m.processes {
+		proc.closeInputCh()
 		if proc.ptySlave != nil {
 			proc.ptySlave.Close()
 		}
