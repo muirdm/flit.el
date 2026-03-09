@@ -3780,9 +3780,10 @@ Also marks buffers as potentially stale to trigger revert check."
                      file dir (and (stringp dir) (flit--file-name-p dir)))
           (if (and (stringp dir) (flit--file-name-p dir))
               (condition-case err
-                  (let* ((all (flit--file-name-handler 'file-name-all-completions file dir)))
-                    (flit--log "DEBUG file-name-completion: flit path, all=%S" all)
-                    (try-completion (or file "") all))
+                  ;; User has committed to a host — connect if needed.
+                  (let ((flit--connection-tier 'connect))
+                    (let* ((all (flit--file-name-handler 'file-name-all-completions file dir)))
+                      (try-completion (or file "") all)))
                 (error
                  (flit--log-info "Completion error: %s" (error-message-string err))
                  nil))
@@ -3803,7 +3804,8 @@ Also marks buffers as potentially stale to trigger revert check."
                (is-flit (and (stringp dir) (flit--file-name-p dir))))
           (if is-flit
               (condition-case err
-                  (progn
+                  ;; User has committed to a host — connect if needed.
+                  (let ((flit--connection-tier 'connect))
                     ;; Fire-and-forget fs/openDir to trigger high-limit async fetch
                     (flit--open-dir-async dir)
                     (let* ((entries (flit--list dir))
