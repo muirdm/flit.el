@@ -646,6 +646,9 @@ type InfoResult struct {
 	// ParentWatched indicates if the parent directory is being watched
 	// (for non-existent files, enables safe negative caching)
 	ParentWatched bool `json:"parentWatched,omitempty"`
+	// NoCache indicates the client should not cache this result
+	// (e.g., volatile paths like /tmp, /dev, /proc, /sys)
+	NoCache bool `json:"noCache,omitempty"`
 }
 
 const maxContentSize = 1024 * 1024      // 1MB

@@ -884,9 +884,11 @@ Each entry has :path and :info fields."
           (flit--log-trace "cache-from-response: path=%s exists=%S parent-watched=%S"
                            path exists-val parent-watched)
           (when (and path info)
-            ;; Always cache the result - watch-based invalidation handles staleness
-            ;; This prevents repeated RPCs for the same path within a short window
-            (flit--cache-put host path info)))))))
+            ;; Skip caching for volatile paths (server sets noCache flag)
+            (unless (eq (plist-get info :noCache) t)
+              ;; Always cache the result - watch-based invalidation handles staleness
+              ;; This prevents repeated RPCs for the same path within a short window
+              (flit--cache-put host path info))))))))
 
 (defun flit--find-entry (parent-info basename)
   "Check if BASENAME exists in PARENT-INFO's children list.
@@ -2662,8 +2664,9 @@ Returns the info plist from fs/info, or nil if file doesn't exist."
        ;; Cache miss - make RPC call
        (t
         (let ((result (flit--send-request host "fs/info" `(:path ,path))))
-          ;; Cache the main result (including non-existent files)
-          (when (plist-get result :path)
+          ;; Cache the main result unless server says not to (volatile paths)
+          (when (and (plist-get result :path)
+                     (not (eq (plist-get result :noCache) t)))
             (flit--cache-put host (plist-get result :path) result))
           ;; Also process any additional cache entries from :cache field
           (flit--cache-from-response host result)

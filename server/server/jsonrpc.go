@@ -338,6 +338,21 @@ func (sess *Session) InitWatcher(fsHandler *fs.Handler) error {
 	return nil
 }
 
+// noWatchPrefixes are path prefixes for volatile/virtual filesystems
+// where file watching is wasteful and caching is inappropriate.
+var noWatchPrefixes = []string{"/tmp/", "/dev/", "/proc/", "/sys/"}
+
+// isNoWatchPath returns true if path is under a volatile/virtual filesystem
+// (e.g., /tmp, /dev, /proc, /sys) where watches should not be set up.
+func isNoWatchPath(path string) bool {
+	for _, prefix := range noWatchPrefixes {
+		if strings.HasPrefix(path, prefix) || path == prefix[:len(prefix)-1] {
+			return true
+		}
+	}
+	return false
+}
+
 // Watch adds a path to this session's watch list
 func (sess *Session) Watch(path string) error {
 	if sess.watcher == nil {
@@ -364,6 +379,9 @@ func (sess *Session) WatchFile(path string) error {
 	if sess.watcher == nil {
 		return fmt.Errorf("file watching not available")
 	}
+	if isNoWatchPath(path) {
+		return nil
+	}
 
 	sess.watchedMu.Lock()
 	defer sess.watchedMu.Unlock()
@@ -384,6 +402,9 @@ func (sess *Session) WatchFile(path string) error {
 func (sess *Session) WatchDir(path string) error {
 	if sess.watcher == nil {
 		return fmt.Errorf("file watching not available")
+	}
+	if isNoWatchPath(path) {
+		return nil
 	}
 
 	sess.watchedMu.Lock()
@@ -407,6 +428,9 @@ func (sess *Session) WatchDir(path string) error {
 // Returns true if an ancestor was found and watched, false otherwise.
 func (sess *Session) WatchPendingFile(filePath string) bool {
 	if sess.watcher == nil {
+		return false
+	}
+	if isNoWatchPath(filePath) {
 		return false
 	}
 
@@ -743,11 +767,11 @@ func (sess *Session) PrefetchAncestors(ctx context.Context, path string, fsHandl
 	}
 	ancestors = append(ancestors, "/")
 
-	// Filter out already-watched paths
+	// Filter out already-watched paths and volatile paths
 	sess.watchedMu.Lock()
 	var toFetch []string
 	for _, p := range ancestors {
-		if sess.watchedPaths[p] == nil {
+		if sess.watchedPaths[p] == nil && !isNoWatchPath(p) {
 			toFetch = append(toFetch, p)
 		}
 	}
@@ -962,6 +986,11 @@ func (s *Server) buildHandlerMap(sess *Session) handler.Map {
 			// For directories with children, async fetch child entries and send notification
 			if result.Children != nil {
 				sess.AsyncFetchChildEntries(params.Path, *result.Children, fs.MaxEntriesDefault, 5*time.Second, s.fsHandler)
+			}
+
+			// Mark volatile paths as non-cacheable
+			if isNoWatchPath(params.Path) {
+				result.NoCache = true
 			}
 
 			// Return InfoResponse with cache entries for unified caching
