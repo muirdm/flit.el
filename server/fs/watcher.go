@@ -273,7 +273,6 @@ func (w *Watcher) Close() error {
 // After that, notifications are debounced until the window expires.
 func (w *Watcher) triggerDebouncedNotification(path string, eventType string, isDirectEvent bool) {
 	w.mu.Lock()
-	defer w.mu.Unlock()
 
 	now := time.Now()
 	state := w.debounceStates[path]
@@ -290,17 +289,23 @@ func (w *Watcher) triggerDebouncedNotification(path string, eventType string, is
 	// If we have a pending debounced notification, just reset the timer
 	if state.timer != nil {
 		state.timer.Reset(debounceInterval)
+		w.mu.Unlock()
 		return
 	}
 
 	// Within burst limit - send immediately
 	if state.count < burstLimit {
 		state.count++
+		count := state.count
+		// Release lock before calling callback to avoid deadlock:
+		// callback may acquire Session.watchedMu, while Session.WatchDir
+		// holds watchedMu and calls watcher.Watch which acquires watcher.mu.
+		w.mu.Unlock()
 		if w.notify != nil {
 			if isDirectEvent {
-				slog.Info("watch: event (burst)", "type", eventType, "path", path, "count", state.count)
+				slog.Info("watch: event (burst)", "type", eventType, "path", path, "count", count)
 			} else {
-				slog.Debug("watch: event (burst)", "type", eventType, "path", path, "count", state.count)
+				slog.Debug("watch: event (burst)", "type", eventType, "path", path, "count", count)
 			}
 			w.notify(WatchEvent{
 				Path: path,
@@ -332,6 +337,7 @@ func (w *Watcher) triggerDebouncedNotification(path string, eventType string, is
 		}
 		w.mu.Unlock()
 	})
+	w.mu.Unlock()
 }
 
 // isDirectlyWatched returns true if the path has a direct watch (refCount > 0)
