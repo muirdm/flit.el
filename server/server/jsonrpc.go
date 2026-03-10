@@ -1330,8 +1330,12 @@ func (s *Server) HandleConnection(conn net.Conn) {
 		slog.Error("Failed to init watcher", "error", err)
 	}
 
+	// Wrap writer with async buffer (see HandleStdio for rationale)
+	aw := newAsyncWriter(conn)
+	defer aw.Close()
+
 	// Create channel with LSP framing (Content-Length headers)
-	ch := channel.Header("")(conn, conn)
+	ch := channel.Header("")(conn, aw)
 
 	// Create and start the jrpc2 server
 	srv := jrpc2.NewServer(s.buildHandlerMap(sess), s.serverOptions())
@@ -1377,9 +1381,14 @@ func (s *Server) HandleStdio(stdin io.Reader, stdout io.Writer) {
 	stdout.Write(readyBytes)
 	stdout.Write([]byte("\n"))
 
+	// Wrap stdout with async buffer so jrpc2 writes don't block on
+	// slow pipes/transports (prevents mutex-held-during-write deadlocks).
+	aw := newAsyncWriter(stdout)
+	defer aw.Close()
+
 	// Create channel with Content-Length framing (no Content-Type header)
 	// We need a WriteCloser, so wrap stdout
-	ch := channel.Header("")(stdin, writeCloser{stdout})
+	ch := channel.Header("")(stdin, writeCloser{aw})
 
 	// Create and start the jrpc2 server
 	srv := jrpc2.NewServer(s.buildHandlerMap(sess), s.serverOptions())
@@ -1432,9 +1441,55 @@ func (wc writeCloser) Close() error {
 	if c, ok := wc.Writer.(io.Closer); ok {
 		return c.Close()
 	}
-	// For stdout, closing means we're done
-	if wc.Writer == os.Stdout {
-		return nil
-	}
 	return nil
+}
+
+// asyncWriter wraps an io.Writer with a large async buffer so that
+// writes complete quickly even when the underlying writer is slow.
+// This prevents the jrpc2 server mutex from being held during slow
+// stdout/network writes, which would block all notifications and
+// responses and can deadlock the transport when both directions are
+// pushing data simultaneously through SSH/ET.
+type asyncWriter struct {
+	ch   chan []byte
+	done chan struct{}
+	err  error
+}
+
+func newAsyncWriter(w io.Writer) *asyncWriter {
+	const maxChunks = 256 // 256 slots; jrpc2 writes whole messages, so each slot is one message
+
+	aw := &asyncWriter{
+		ch:   make(chan []byte, maxChunks),
+		done: make(chan struct{}),
+	}
+	go func() {
+		defer close(aw.done)
+		for data := range aw.ch {
+			if _, err := w.Write(data); err != nil {
+				aw.err = err
+				// Drain remaining sends so writers don't block forever
+				for range aw.ch {
+				}
+				return
+			}
+		}
+	}()
+	return aw
+}
+
+func (aw *asyncWriter) Write(p []byte) (int, error) {
+	if aw.err != nil {
+		return 0, aw.err
+	}
+	data := make([]byte, len(p))
+	copy(data, p)
+	aw.ch <- data
+	return len(p), nil
+}
+
+func (aw *asyncWriter) Close() error {
+	close(aw.ch)
+	<-aw.done
+	return aw.err
 }
