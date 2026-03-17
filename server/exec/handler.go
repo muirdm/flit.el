@@ -192,8 +192,11 @@ func (m *Manager) Start(params StartParams) (*StartResult, error) {
 			cmdName:  params.Cmd,
 			ptyFile:  ptmx,
 			ptySlave: ptySlave,
-			cancel:   cancel,
-			inputCh:  make(chan string, 1024),
+			cancel: func() {
+				cancel()
+				ptmx.Close() // unblock any blocked write/read on the PTY
+			},
+			inputCh: make(chan string, 1024),
 		}
 		go m.inputWriter(proc)
 
@@ -240,7 +243,10 @@ func (m *Manager) Start(params StartParams) (*StartResult, error) {
 			cmd:     cmd,
 			cmdName: params.Cmd,
 			stdin:   stdin,
-			cancel:  cancel,
+			cancel: func() {
+				cancel()
+				stdin.Close() // unblock any blocked write on stdin
+			},
 			inputCh: make(chan string, 1024),
 		}
 		go m.inputWriter(proc)
