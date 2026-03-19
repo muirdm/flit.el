@@ -3930,11 +3930,17 @@ Also marks buffers as potentially stale to trigger revert check."
        ((eq operation 'copy-file)
         (let* ((newname (nth 1 args)))
           (flit--with-parsed (host src-path) filename
-            (let ((dest-path (if (flit--file-name-p newname)
-                                 (cdr (flit--parse-file-name newname))
-                               newname)))
-              (flit--send-request host "fs/copy" `(:src ,src-path :dest ,dest-path))
-              nil))))
+            (if (flit--file-name-p newname)
+                ;; Both remote: server-side copy
+                (let ((dest-path (cdr (flit--parse-file-name newname))))
+                  (flit--send-request host "fs/copy" `(:src ,src-path :dest ,dest-path))
+                  nil)
+              ;; Remote src, local dest: read content and write directly
+              (let* ((result (flit--read filename))
+                     (content (plist-get result :content)))
+                (with-temp-file newname
+                  (set-buffer-multibyte nil)
+                  (insert content)))))))
 
        ((eq operation 'copy-directory)
         ;; copy-directory args: (DIRECTORY NEWNAME &optional KEEP-TIME PARENTS COPY-CONTENTS)
