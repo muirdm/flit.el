@@ -2893,13 +2893,14 @@ Implemented using exec/start and waiting for completion."
                        :buffer stderr-buf
                        :noquery t
                        :filter #'flit--default-process-filter))
-         ;; Start the main process
-         (proc (flit--exec-start host "flit-sync-exec" cmd args cwd nil)))
-    ;; Set stdout buffer and use default filter
-    (set-process-buffer proc stdout-buf)
-    (set-process-filter proc #'flit--default-process-filter)
-    ;; Link stderr process
-    (process-put proc 'flit-stderr-proc stderr-proc)
+         ;; Start the main process - setup buffer/filter/stderr before RPC
+         ;; to handle exec/exit arriving during the synchronous RPC call
+         (proc (flit--exec-start host "flit-sync-exec" cmd args cwd nil
+                                 nil nil nil
+                                 (lambda (p)
+                                   (set-process-buffer p stdout-buf)
+                                   (set-process-filter p #'flit--default-process-filter)
+                                   (process-put p 'flit-stderr-proc stderr-proc)))))
     ;; Send stdin if provided
     (when stdin
       (process-send-string proc stdin)
@@ -2921,12 +2922,16 @@ Implemented using exec/start and waiting for completion."
             :stderr stderr
             :exitCode exit-code))))
 
-(defun flit--exec-start (host name cmd args cwd env &optional pty rows cols)
+(defun flit--exec-start (host name cmd args cwd env &optional pty rows cols setup-fn)
   "Start async process CMD with ARGS on HOST.
 NAME is the process name for Emacs.
 CWD is the working directory on the remote.
 ENV is an alist of environment variables.
 If PTY is non-nil, allocate a pseudo-terminal with ROWS x COLS dimensions.
+SETUP-FN, if non-nil, is called with the process object before the RPC call.
+Use this to set buffer, filter, sentinel, etc. before the exec/start RPC,
+so that if exec/exit arrives during the synchronous RPC, the correct
+sentinel and filter are already installed.
 Returns an Emacs process object."
   (let* (;; Generate unique proc-id on client side to avoid race conditions
          ;; between exec/exit notifications and process registration
@@ -2969,6 +2974,10 @@ Returns an Emacs process object."
       (setq params (plist-put params :pty t))
       (setq params (plist-put params :rows (or rows 24)))
       (setq params (plist-put params :cols (or cols 80))))
+    ;; Call setup-fn before RPC so filter/sentinel/buffer are set before
+    ;; any exec/exit notification arrives during the synchronous RPC call
+    (when setup-fn
+      (funcall setup-fn proc))
     ;; Start the remote process - notifications may arrive during this call,
     ;; but the process is already registered so they'll be handled correctly
     (flit--log-debug "exec-start: proc=%s proc-id=%s" proc proc-id)
@@ -4021,9 +4030,9 @@ Also marks buffers as potentially stale to trigger revert check."
                                    80)))
                        (env (flit--compute-env-delta))
                        (proc (flit--exec-start host name program program-args
-                                               cwd env need-pty rows cols)))
-                  (when buf
-                    (set-process-buffer proc buf))
+                                               cwd env need-pty rows cols
+                                               (when buf
+                                                 (lambda (p) (set-process-buffer p buf))))))
                   proc))
             (flit--call-default operation args))))
 
@@ -4964,29 +4973,29 @@ Delegates to our start-file-process handler."
                                   (window-live-p (get-buffer-window buf))
                                   (window-width (get-buffer-window buf)))
                              80)))
+                 ;; Setup function runs before exec/start RPC to avoid race
+                 ;; where exec/exit arrives before filter/sentinel are set
+                 (setup-fn
+                  (lambda (proc)
+                    (when buf
+                      (set-process-buffer proc buf))
+                    (when coding
+                      (set-process-coding-system proc coding coding))
+                    (when filter
+                      (set-process-filter proc filter))
+                    (when sentinel
+                      (set-process-sentinel proc sentinel))
+                    (when stderr
+                      (let* ((stderr-buf (if (bufferp stderr) stderr (get-buffer-create stderr)))
+                             (stderr-proc (make-pipe-process
+                                           :name (format "%s-stderr" name)
+                                           :buffer stderr-buf
+                                           :noquery t)))
+                        (flit--log-trace "handle-make-process: created stderr proc=%s" stderr-proc)
+                        (process-put proc 'flit-stderr-proc stderr-proc)))))
                  (proc (flit--exec-start host name program program-args
-                                         cwd env need-pty rows cols)))
-            (flit--log-trace "handle-make-process: proc=%s" proc)
-            (when buf
-              (set-process-buffer proc buf))
-            ;; Set coding system if specified
-            (when coding
-              (set-process-coding-system proc coding coding))
-            (when filter
-              (set-process-filter proc filter))
-            (when sentinel
-              (set-process-sentinel proc sentinel))
-            ;; Handle :stderr - create a pipe process for the stderr buffer
-            ;; so that (get-buffer-process stderr-buf) returns something
-            (when stderr
-              (let* ((stderr-buf (if (bufferp stderr) stderr (get-buffer-create stderr)))
-                     (stderr-proc (make-pipe-process
-                                   :name (format "%s-stderr" name)
-                                   :buffer stderr-buf
-                                   :noquery t)))
-                (flit--log-trace "handle-make-process: created stderr proc=%s" stderr-proc)
-                ;; Store reference so we can send stderr to it
-                (process-put proc 'flit-stderr-proc stderr-proc)))
+                                         cwd env need-pty rows cols
+                                         setup-fn)))
             ;; Mark as flit PTY process so process-tty-name advice can return a name
             (when need-pty
               (process-put proc 'flit-pty t))
