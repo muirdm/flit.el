@@ -1078,8 +1078,20 @@ process receives output, or until timeout expires."
               got-output)
           ;; No connection available - fall through to default
           (funcall orig-fn process timeout timeout-msecs just-this-one)))
-    ;; Not a flit process - use default
-    (funcall orig-fn process timeout timeout-msecs just-this-one)))
+    ;; Not a flit process - use default, then process pending timers.
+    ;; jsonrpc-request's wait loop uses accept-process-output which
+    ;; doesn't fire timers.  This deadlocks when requests nest (e.g.
+    ;; notification handler triggers a sync RPC while an outer
+    ;; jsonrpc-request is waiting) because jsonrpc.el's bug#67945 fix
+    ;; defers response callbacks via run-at-time.  Calling sit-for
+    ;; after accept-process-output ensures those timers fire.
+    ;; We pass no :timeout to jsonrpc-request (so there's no timeout
+    ;; timer for sit-for to fire) and check our own deadline instead.
+    (prog1 (funcall orig-fn process timeout timeout-msecs just-this-one)
+      (sit-for 0 t)
+      (when (and flit--request-deadline
+                 (> (float-time) flit--request-deadline))
+        (signal 'flit-request-timeout nil)))))
 
 (advice-add 'accept-process-output :around #'flit--accept-process-output-advice)
 
@@ -2578,6 +2590,16 @@ If so, log the stuck data to help diagnose hangs."
                    "jsonrpc buffer stuck: %d unprocessed bytes, no Content-Length header at point:\n  %s"
                    unprocessed (string-replace "\n" "\n  " head)))))))))))
 
+(defvar flit--request-deadline nil
+  "Deadline for the current `flit--send-request' call, or nil.
+Used by `flit--accept-process-output-advice' to implement timeouts
+without Emacs timers.  We avoid timer-based timeouts because our
+advice calls `sit-for' (to fire jsonrpc.el's bug#67945 anxious
+continuation callbacks), and `sit-for' would also fire the timeout
+timer, aborting large responses mid-transfer.")
+
+(define-error 'flit-request-timeout "Flit request timed out")
+
 (defun flit--send-request (host method params &optional timeout)
   "Send a JSON-RPC request to HOST and wait for response.
 METHOD is the RPC method name, PARAMS is a plist of parameters.
@@ -2586,15 +2608,23 @@ Returns the result or signals an error."
   (let ((conn (flit--get-connection host)))
     (unless conn
       (error "Cannot connect to flit-server on %s" host))
-    (let* ((start-time (float-time)))
+    (let* ((start-time (float-time))
+           (flit--request-deadline (+ (float-time) (or timeout flit-timeout))))
       (condition-case err
-          (let ((result (jsonrpc-request conn method params
-                                         :timeout (or timeout flit-timeout))))
+          (let ((result (jsonrpc-request conn method params :timeout nil)))
             (flit--log-info "RPC %s %S -> %.3fs%s"
                             method (flit--sanitize-params-for-log params)
                             (- (float-time) start-time)
                             (flit--format-rpc-result-extra method result))
             result)
+        (flit-request-timeout
+         (flit--log-error "RPC %s %S -> ERROR after %.3fs: %S"
+                          method (flit--sanitize-params-for-log params)
+                          (- (float-time) start-time) '((jsonrpc-error-message . "Timed out")))
+         (flit--check-jsonrpc-buffer conn)
+         (signal 'jsonrpc-error
+                 (cons (format "request for %s timed out" method)
+                       '((jsonrpc-error-message . "Timed out")))))
         (jsonrpc-error
          (flit--log-error "RPC %s %S -> ERROR after %.3fs: %S"
                           method (flit--sanitize-params-for-log params)
