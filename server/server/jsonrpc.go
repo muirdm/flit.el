@@ -31,11 +31,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/creachadair/jrpc2"
-	"github.com/creachadair/jrpc2/channel"
-	"github.com/creachadair/jrpc2/handler"
 	"github.com/muirdm/flit.el/eden"
 	"github.com/muirdm/flit.el/exec"
+	"github.com/muirdm/flit.el/flitrpc"
 	"github.com/muirdm/flit.el/fs"
 	"github.com/muirdm/flit.el/tunnel"
 	"github.com/muirdm/flit.el/util"
@@ -159,7 +157,7 @@ type WatchMeta struct {
 
 // Session holds per-connection state (file watcher, process manager, etc.)
 type Session struct {
-	server        *jrpc2.Server
+	notify        func(ctx context.Context, method string, params any) error
 	logger        *slog.Logger // Logger that sends logs via RPC
 	watcher       *fs.Watcher
 	edenWatcher   *eden.Watcher
@@ -179,16 +177,16 @@ func NewSession(logLevel slog.Level) *Session {
 		openFiles:    make(map[string]bool),
 		richFetched:  make(map[string]bool),
 		logLevel:     logLevel,
-		logger:       NewDiscardLogger(), // Will be replaced when server is set
+		logger:       NewDiscardLogger(), // Will be replaced when notifier is set
 	}
-	// Initialize process manager - callbacks check for nil server
+	// Initialize process manager - callbacks check for nil notify
 	sess.procManager = exec.NewManager(
 		// onOutput callback
 		func(procID string, stream string, data string) {
-			if sess.server != nil {
+			if sess.notify != nil {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
-				if err := sess.server.Notify(ctx, "exec/output", map[string]string{
+				if err := sess.notify(ctx, "exec/output", map[string]string{
 					"procId": procID,
 					"stream": stream,
 					"data":   data,
@@ -200,10 +198,10 @@ func NewSession(logLevel slog.Level) *Session {
 		// onExit callback
 		func(procID string, exitCode int) {
 			sess.logger.Info("exec/exit", "procID", procID, "exitCode", exitCode)
-			if sess.server != nil {
+			if sess.notify != nil {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
-				if err := sess.server.Notify(ctx, "exec/exit", map[string]interface{}{
+				if err := sess.notify(ctx, "exec/exit", map[string]interface{}{
 					"procId":   procID,
 					"exitCode": exitCode,
 				}); err != nil {
@@ -216,15 +214,9 @@ func NewSession(logLevel slog.Level) *Session {
 	return sess
 }
 
-// SetServer sets the jrpc2 server for sending notifications and creates the RPC logger
-func (sess *Session) SetServer(srv *jrpc2.Server) {
-	sess.server = srv
-	// Create notify function for use by various managers
-	notify := func(method string, params any) error {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		return srv.Notify(ctx, method, params)
-	}
+// SetNotifier configures notification delivery and creates the RPC logger.
+func (sess *Session) SetNotifier(notify func(ctx context.Context, method string, params any) error) {
+	sess.notify = notify
 	// Create RPC logger that sends logs to client
 	rpcHandler := NewRPCLogHandler(sess.logLevel, notify)
 	sess.logger = slog.New(rpcHandler)
@@ -241,7 +233,7 @@ func (sess *Session) Logger() *slog.Logger {
 // InitWatcher initializes the file watcher with notification callback
 func (sess *Session) InitWatcher(fsHandler *fs.Handler) error {
 	watcher, err := fs.NewWatcher(func(event fs.WatchEvent) {
-		if sess.server != nil {
+		if sess.notify != nil {
 			// For "modified" events on watched files, check if mtime/size actually changed.
 			// This suppresses duplicate notifications from fsnotify bursts and our own writes.
 			if event.Type == "modified" {
@@ -285,7 +277,7 @@ func (sess *Session) InitWatcher(fsHandler *fs.Handler) error {
 				if event.Type == "deleted" {
 					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 					defer cancel()
-					sess.server.Notify(ctx, "fs/changed", map[string]interface{}{
+					sess.notify(ctx, "fs/changed", map[string]interface{}{
 						"path":  event.Path,
 						"type":  event.Type,
 						"cache": []fs.CacheEntry{},
@@ -300,7 +292,7 @@ func (sess *Session) InitWatcher(fsHandler *fs.Handler) error {
 				if event.Type == "deleted" {
 					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 					defer cancel()
-					sess.server.Notify(ctx, "fs/changed", map[string]interface{}{
+					sess.notify(ctx, "fs/changed", map[string]interface{}{
 						"path":  event.Path,
 						"type":  event.Type,
 						"cache": []fs.CacheEntry{},
@@ -326,7 +318,7 @@ func (sess *Session) InitWatcher(fsHandler *fs.Handler) error {
 
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			if err := sess.server.Notify(ctx, "fs/changed", notification); err != nil {
+			if err := sess.notify(ctx, "fs/changed", notification); err != nil {
 				log.Printf("Failed to send notification: %v", err)
 			}
 		}
@@ -632,7 +624,7 @@ func (sess *Session) handleEdenCheckout(root string, fsHandler *fs.Handler) {
 
 // sendFileChangedNotification sends an fs/changed notification for a file.
 func (sess *Session) sendFileChangedNotification(path, eventType string, fsHandler *fs.Handler) {
-	if sess.server == nil {
+	if sess.notify == nil {
 		return
 	}
 
@@ -675,7 +667,7 @@ func (sess *Session) sendFileChangedNotification(path, eventType string, fsHandl
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	sess.server.Notify(ctx, "fs/changed", notification)
+	sess.notify(ctx, "fs/changed", notification)
 }
 
 // IsFileOpen returns true if the file is currently open in a client buffer
@@ -747,7 +739,7 @@ func (sess *Session) AsyncFetchChildEntries(dirPath string, children []fs.DirChi
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
-		sess.server.Notify(ctx, "fs/entryInfo", map[string]interface{}{
+		sess.notify(ctx, "fs/entryInfo", map[string]interface{}{
 			"path":  dirPath,
 			"cache": cacheEntries,
 		})
@@ -840,7 +832,7 @@ func (sess *Session) PrefetchAncestors(ctx context.Context, path string, fsHandl
 	}
 
 	// Send notification to client
-	if err := sess.server.Notify(ctx, "fs/ancestorInfo", map[string]interface{}{
+	if err := sess.notify(ctx, "fs/ancestorInfo", map[string]interface{}{
 		"cache": cacheEntries,
 	}); err != nil {
 		sess.logger.Error("fs/ancestorInfo notification failed", "error", err)
@@ -903,411 +895,344 @@ func (sess *Session) Close() {
 	}
 }
 
-// buildHandlerMap creates the handler map for the jrpc2 server
-func (s *Server) buildHandlerMap(sess *Session) handler.Map {
-	return handler.Map{
-		// File system operations
-		"fs/stat": handler.New(func(ctx context.Context, params json.RawMessage) (interface{}, error) {
+// registerHandlers registers all RPC handlers with a flitrpc server.
+// Handler logic is shared with buildHandlerMap above.
+func (s *Server) registerHandlers(rpc *flitrpc.Server, sess *Session) {
+	// Simple handlers: take json.RawMessage, return (any, error)
+	simple := func(method string, fn func(json.RawMessage) (interface{}, error)) {
+		rpc.HandleFunc(method, func(params json.RawMessage) (any, error) {
 			s.touch()
-			return s.fsHandler.Stat(params)
-		}),
-		"fs/read": handler.New(func(ctx context.Context, params json.RawMessage) (interface{}, error) {
-			s.touch()
-			return s.fsHandler.Read(params)
-		}),
-		"fs/write": handler.New(func(ctx context.Context, params json.RawMessage) (interface{}, error) {
-			s.touch()
-			startTime := time.Now()
-			var p fs.WriteParams
-			if err := json.Unmarshal(params, &p); err != nil {
-				return nil, &jrpc2.Error{Code: jrpc2.InvalidParams, Message: "Invalid params"}
-			}
-			// Pre-set mtime and size to suppress fsnotify notifications during write
-			sess.UpdateFileState(p.Path, time.Now().Unix(), int64(len(p.Content)))
-			result, err := s.fsHandler.Write(&p)
-			if err == nil {
-				// Update with actual mtime/size after write
-				if infoResp, ok := result.(*fs.InfoResponse); ok && infoResp.InfoResult != nil {
-					sess.UpdateFileState(infoResp.Path, infoResp.Mtime, infoResp.Size)
-				}
-			}
-			sess.logger.Info("fs/write done", "path", p.Path, "elapsed", time.Since(startTime))
-			return result, err
-		}),
-		"fs/mkdir": handler.New(func(ctx context.Context, params json.RawMessage) (interface{}, error) {
-			s.touch()
-			return s.fsHandler.Mkdir(params)
-		}),
-		"fs/delete": handler.New(func(ctx context.Context, params json.RawMessage) (interface{}, error) {
-			s.touch()
-			return s.fsHandler.Delete(params)
-		}),
-		"fs/rename": handler.New(func(ctx context.Context, params json.RawMessage) (interface{}, error) {
-			s.touch()
-			return s.fsHandler.Rename(params)
-		}),
-		"fs/copy": handler.New(func(ctx context.Context, params json.RawMessage) (interface{}, error) {
-			s.touch()
-			return s.fsHandler.Copy(params)
-		}),
-		"fs/exists": handler.New(func(ctx context.Context, params json.RawMessage) (interface{}, error) {
-			s.touch()
-			return s.fsHandler.Exists(params)
-		}),
-		"fs/realpath": handler.New(func(ctx context.Context, params json.RawMessage) (interface{}, error) {
-			s.touch()
-			return s.fsHandler.Realpath(params)
-		}),
-		"fs/info": handler.New(func(ctx context.Context, params struct {
-			Path string `json:"path"`
-		}) (interface{}, error) {
-			s.touch()
-			// Use GetInfoWithEntries for fast response - entryInfo sent async
-			result, err := s.fsHandler.GetInfoWithEntries(params.Path)
-			if err != nil {
-				return nil, err
-			}
-			// Auto-watch so we get notifications for changes
-			if result.Exists && result.Type == "file" {
-				sess.WatchFile(params.Path)
-			} else if result.Exists && result.Type == "directory" {
-				sess.WatchDir(params.Path)
-				// Mark as listed so fs/changed includes children for this directory
-				if result.Children != nil {
-					sess.MarkDirListed(params.Path)
-				}
-			}
-			// For non-existent files, try to watch parent directory
-			// so we can notify when the file is created (negative caching)
-			if !result.Exists {
-				result.ParentWatched = sess.WatchPendingFile(params.Path)
-			}
+			return fn(params)
+		})
+	}
 
-			// For directories with children, async fetch child entries and send notification
+	// Filesystem operations
+	simple("fs/stat", s.fsHandler.Stat)
+	simple("fs/read", s.fsHandler.Read)
+	simple("fs/mkdir", s.fsHandler.Mkdir)
+	simple("fs/delete", s.fsHandler.Delete)
+	simple("fs/rename", s.fsHandler.Rename)
+	simple("fs/copy", s.fsHandler.Copy)
+	simple("fs/exists", s.fsHandler.Exists)
+	simple("fs/realpath", s.fsHandler.Realpath)
+	simple("fs/batch", s.fsHandler.Batch)
+	simple("fs/chmod", s.fsHandler.Chmod)
+	simple("fs/touch", s.fsHandler.Touch)
+	simple("fs/copy-dir", s.fsHandler.CopyDir)
+
+	// fs/write needs special handling for mtime suppression
+	rpc.HandleFunc("fs/write", func(params json.RawMessage) (any, error) {
+		s.touch()
+		startTime := time.Now()
+		var p fs.WriteParams
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, fmt.Errorf("invalid params: %w", err)
+		}
+		sess.UpdateFileState(p.Path, time.Now().Unix(), int64(len(p.Content)))
+		result, err := s.fsHandler.Write(&p)
+		if err == nil {
+			if infoResp, ok := result.(*fs.InfoResponse); ok && infoResp.InfoResult != nil {
+				sess.UpdateFileState(infoResp.Path, infoResp.Mtime, infoResp.Size)
+			}
+		}
+		sess.logger.Info("fs/write done", "path", p.Path, "elapsed", time.Since(startTime))
+		return result, err
+	})
+
+	// fs/info with auto-watch and async child fetch
+	flitrpc.HandleTyped(rpc, "fs/info", func(params struct {
+		Path string `json:"path"`
+	}) (any, error) {
+		s.touch()
+		result, err := s.fsHandler.GetInfoWithEntries(params.Path)
+		if err != nil {
+			return nil, err
+		}
+		if result.Exists && result.Type == "file" {
+			sess.WatchFile(params.Path)
+		} else if result.Exists && result.Type == "directory" {
+			sess.WatchDir(params.Path)
 			if result.Children != nil {
-				sess.AsyncFetchChildEntries(params.Path, *result.Children, fs.MaxEntriesDefault, 5*time.Second, s.fsHandler)
+				sess.MarkDirListed(params.Path)
 			}
+		}
+		if !result.Exists {
+			result.ParentWatched = sess.WatchPendingFile(params.Path)
+		}
+		if result.Children != nil {
+			sess.AsyncFetchChildEntries(params.Path, *result.Children, fs.MaxEntriesDefault, 5*time.Second, s.fsHandler)
+		}
+		if isNoWatchPath(params.Path) {
+			result.NoCache = true
+		}
+		return &fs.InfoResponse{
+			InfoResult: result,
+			Cache:      fs.BuildCacheEntries(result),
+		}, nil
+	})
 
-			// Mark volatile paths as non-cacheable
-			if isNoWatchPath(params.Path) {
-				result.NoCache = true
-			}
-
-			// Return InfoResponse with cache entries for unified caching
-			return &fs.InfoResponse{
-				InfoResult: result,
-				Cache:      fs.BuildCacheEntries(result),
-			}, nil
-		}),
-		"fs/batch": handler.New(func(ctx context.Context, params json.RawMessage) (interface{}, error) {
-			s.touch()
-			return s.fsHandler.Batch(params)
-		}),
-		"fs/chmod": handler.New(func(ctx context.Context, params json.RawMessage) (interface{}, error) {
-			s.touch()
-			return s.fsHandler.Chmod(params)
-		}),
-		"fs/touch": handler.New(func(ctx context.Context, params json.RawMessage) (interface{}, error) {
-			s.touch()
-			return s.fsHandler.Touch(params)
-		}),
-		"fs/copy-dir": handler.New(func(ctx context.Context, params json.RawMessage) (interface{}, error) {
-			s.touch()
-			return s.fsHandler.CopyDir(params)
-		}),
-
-		// Signal that client is browsing a directory (find-file, dired)
-		// Returns directory info; triggers async child entry fetch with higher limit
-		"fs/openDir": handler.New(func(ctx context.Context, params struct {
-			Path string `json:"path"`
-		}) (interface{}, error) {
-			s.touch()
-			result, err := s.fsHandler.GetInfoWithEntries(params.Path)
-			if err != nil {
-				return nil, err
-			}
-			// Watch the directory
-			if result.Exists && result.Type == "directory" {
-				sess.WatchDir(params.Path)
-				if result.Children != nil {
-					sess.MarkDirListed(params.Path)
-				}
-			}
-			// Async fetch child entries with higher limit for explicit listing
+	// fs/openDir with higher child limit
+	flitrpc.HandleTyped(rpc, "fs/openDir", func(params struct {
+		Path string `json:"path"`
+	}) (any, error) {
+		s.touch()
+		result, err := s.fsHandler.GetInfoWithEntries(params.Path)
+		if err != nil {
+			return nil, err
+		}
+		if result.Exists && result.Type == "directory" {
+			sess.WatchDir(params.Path)
 			if result.Children != nil {
-				sess.AsyncFetchChildEntries(params.Path, *result.Children, fs.MaxEntriesExplicit, 30*time.Second, s.fsHandler)
+				sess.MarkDirListed(params.Path)
 			}
-			// Return InfoResponse with cache entries
-			return &fs.InfoResponse{
-				InfoResult: result,
-				Cache:      fs.BuildCacheEntries(result),
-			}, nil
-		}),
+		}
+		if result.Children != nil {
+			sess.AsyncFetchChildEntries(params.Path, *result.Children, fs.MaxEntriesExplicit, 30*time.Second, s.fsHandler)
+		}
+		return &fs.InfoResponse{
+			InfoResult: result,
+			Cache:      fs.BuildCacheEntries(result),
+		}, nil
+	})
 
-		// File watching
-		"fs/watch": handler.New(func(ctx context.Context, params struct {
-			Path string `json:"path"`
-		}) (interface{}, error) {
-			s.touch()
-			if err := sess.Watch(params.Path); err != nil {
-				return nil, err
-			}
-			return map[string]interface{}{"watching": params.Path}, nil
-		}),
-		"fs/unwatch": handler.New(func(ctx context.Context, params struct {
-			Path string `json:"path"`
-		}) (interface{}, error) {
-			s.touch()
-			if err := sess.Unwatch(params.Path); err != nil {
-				return nil, err
-			}
-			return map[string]interface{}{"unwatched": params.Path}, nil
-		}),
+	// File watching
+	flitrpc.HandleTyped(rpc, "fs/watch", func(params struct {
+		Path string `json:"path"`
+	}) (any, error) {
+		s.touch()
+		if err := sess.Watch(params.Path); err != nil {
+			return nil, err
+		}
+		return map[string]interface{}{"watching": params.Path}, nil
+	})
+	flitrpc.HandleTyped(rpc, "fs/unwatch", func(params struct {
+		Path string `json:"path"`
+	}) (any, error) {
+		s.touch()
+		if err := sess.Unwatch(params.Path); err != nil {
+			return nil, err
+		}
+		return map[string]interface{}{"unwatched": params.Path}, nil
+	})
 
-		// File lifecycle - client informs server when files are opened/closed
-		"fs/open": handler.New(func(ctx context.Context, params struct {
-			Path string `json:"path"`
-		}) (interface{}, error) {
-			s.touch()
-			// Kick off ancestor prefetch immediately in background
-			go sess.PrefetchAncestors(context.Background(), params.Path, s.fsHandler)
-			if err := sess.OpenFile(params.Path); err != nil {
-				return nil, err
-			}
-			// Start Eden watching if this file is in an Eden repo
-			sess.EnsureEdenWatching(params.Path)
-			return map[string]interface{}{"opened": params.Path}, nil
-		}),
-		"fs/close": handler.New(func(ctx context.Context, params struct {
-			Path string `json:"path"`
-		}) (interface{}, error) {
-			s.touch()
-			if err := sess.CloseFile(params.Path); err != nil {
-				return nil, err
-			}
-			return map[string]interface{}{"closed": params.Path}, nil
-		}),
-		"fs/forget": handler.New(func(ctx context.Context, params struct {
-			Path string `json:"path"`
-		}) (interface{}, error) {
-			s.touch()
-			// Forget decrements refcount for cached paths (directories, negative cache)
-			// For now, just unwatch - can add refcounting later if needed
-			if err := sess.Unwatch(params.Path); err != nil {
-				return nil, err
-			}
-			return map[string]interface{}{"forgotten": params.Path}, nil
-		}),
+	// File lifecycle
+	flitrpc.HandleTyped(rpc, "fs/open", func(params struct {
+		Path string `json:"path"`
+	}) (any, error) {
+		s.touch()
+		go sess.PrefetchAncestors(context.Background(), params.Path, s.fsHandler)
+		if err := sess.OpenFile(params.Path); err != nil {
+			return nil, err
+		}
+		sess.EnsureEdenWatching(params.Path)
+		return map[string]interface{}{"opened": params.Path}, nil
+	})
+	flitrpc.HandleTyped(rpc, "fs/close", func(params struct {
+		Path string `json:"path"`
+	}) (any, error) {
+		s.touch()
+		if err := sess.CloseFile(params.Path); err != nil {
+			return nil, err
+		}
+		return map[string]interface{}{"closed": params.Path}, nil
+	})
+	flitrpc.HandleTyped(rpc, "fs/forget", func(params struct {
+		Path string `json:"path"`
+	}) (any, error) {
+		s.touch()
+		if err := sess.Unwatch(params.Path); err != nil {
+			return nil, err
+		}
+		return map[string]interface{}{"forgotten": params.Path}, nil
+	})
 
-		// Clear client-side cache state (richFetched, etc.)
-		// Called when client clears its cache to re-sync state
-		"session/clearCache": handler.New(func(ctx context.Context, params struct{}) (interface{}, error) {
-			s.touch()
-			sess.ClearCacheState()
-			return map[string]interface{}{"ok": true}, nil
-		}),
+	// Session
+	rpc.HandleFunc("session/clearCache", func(_ json.RawMessage) (any, error) {
+		s.touch()
+		sess.ClearCacheState()
+		return map[string]interface{}{"ok": true}, nil
+	})
 
-		// Process execution
-		"exec/start": handler.New(func(ctx context.Context, params exec.StartParams) (*exec.StartResult, error) {
-			s.touch()
-			if sess.procManager == nil {
-				return nil, fmt.Errorf("process manager not initialized")
-			}
-			return sess.procManager.Start(params)
-		}),
-		"exec/input": handler.New(func(ctx context.Context, params exec.InputParams) (interface{}, error) {
-			s.touch()
-			if sess.procManager == nil {
-				return nil, fmt.Errorf("process manager not initialized")
-			}
-			if err := sess.procManager.Input(params); err != nil {
-				return nil, err
-			}
-			return map[string]bool{"ok": true}, nil
-		}),
-		"exec/signal": handler.New(func(ctx context.Context, params exec.SignalParams) (interface{}, error) {
-			s.touch()
-			if sess.procManager == nil {
-				return nil, fmt.Errorf("process manager not initialized")
-			}
-			if err := sess.procManager.Signal(params); err != nil {
-				return nil, err
-			}
-			return map[string]bool{"ok": true}, nil
-		}),
-		"exec/close-input": handler.New(func(ctx context.Context, params struct {
-			ProcID string `json:"procId"`
-		}) (interface{}, error) {
-			s.touch()
-			if sess.procManager == nil {
-				return nil, fmt.Errorf("process manager not initialized")
-			}
-			if err := sess.procManager.CloseInput(params.ProcID); err != nil {
-				return nil, err
-			}
-			return map[string]bool{"ok": true}, nil
-		}),
-		"exec/ptyctl": handler.New(func(ctx context.Context, params exec.PtyCtlParams) (interface{}, error) {
-			s.touch()
-			if sess.procManager == nil {
-				return nil, fmt.Errorf("process manager not initialized")
-			}
-			if err := sess.procManager.PtyCtl(params); err != nil {
-				return nil, err
-			}
-			return map[string]bool{"ok": true}, nil
-		}),
+	// Process execution
+	flitrpc.HandleTyped(rpc, "exec/start", func(params exec.StartParams) (any, error) {
+		s.touch()
+		if sess.procManager == nil {
+			return nil, fmt.Errorf("process manager not initialized")
+		}
+		return sess.procManager.Start(params)
+	})
+	flitrpc.HandleTyped(rpc, "exec/input", func(params exec.InputParams) (any, error) {
+		s.touch()
+		if sess.procManager == nil {
+			return nil, fmt.Errorf("process manager not initialized")
+		}
+		if err := sess.procManager.Input(params); err != nil {
+			return nil, err
+		}
+		return map[string]bool{"ok": true}, nil
+	})
+	flitrpc.HandleTyped(rpc, "exec/signal", func(params exec.SignalParams) (any, error) {
+		s.touch()
+		if sess.procManager == nil {
+			return nil, fmt.Errorf("process manager not initialized")
+		}
+		if err := sess.procManager.Signal(params); err != nil {
+			return nil, err
+		}
+		return map[string]bool{"ok": true}, nil
+	})
+	flitrpc.HandleTyped(rpc, "exec/close-input", func(params struct {
+		ProcID string `json:"procId"`
+	}) (any, error) {
+		s.touch()
+		if sess.procManager == nil {
+			return nil, fmt.Errorf("process manager not initialized")
+		}
+		if err := sess.procManager.CloseInput(params.ProcID); err != nil {
+			return nil, err
+		}
+		return map[string]bool{"ok": true}, nil
+	})
+	flitrpc.HandleTyped(rpc, "exec/ptyctl", func(params exec.PtyCtlParams) (any, error) {
+		s.touch()
+		if sess.procManager == nil {
+			return nil, fmt.Errorf("process manager not initialized")
+		}
+		if err := sess.procManager.PtyCtl(params); err != nil {
+			return nil, err
+		}
+		return map[string]bool{"ok": true}, nil
+	})
 
-		// System info (cross-platform)
-		"sys/info": handler.New(func(ctx context.Context) (*SysInfo, error) {
-			s.touch()
-			info := &SysInfo{
-				OS:   runtime.GOOS,
-				Arch: runtime.GOARCH,
-				Pid:  os.Getpid(),
-			}
-			if home, err := os.UserHomeDir(); err == nil {
-				info.HomeDir = home
-			}
-			if hostname, err := os.Hostname(); err == nil {
-				info.Hostname = hostname
-			}
-			if u, err := user.Current(); err == nil {
-				info.Username = u.Username
-			}
-			// Split PATH into components
-			if pathEnv := os.Getenv("PATH"); pathEnv != "" {
-				info.Path = strings.Split(pathEnv, string(os.PathListSeparator))
-			}
-			return info, nil
-		}),
+	// System info
+	rpc.HandleFunc("sys/info", func(_ json.RawMessage) (any, error) {
+		s.touch()
+		info := &SysInfo{
+			OS:   runtime.GOOS,
+			Arch: runtime.GOARCH,
+			Pid:  os.Getpid(),
+		}
+		if home, err := os.UserHomeDir(); err == nil {
+			info.HomeDir = home
+		}
+		if hostname, err := os.Hostname(); err == nil {
+			info.Hostname = hostname
+		}
+		if u, err := user.Current(); err == nil {
+			info.Username = u.Username
+		}
+		if pathEnv := os.Getenv("PATH"); pathEnv != "" {
+			info.Path = strings.Split(pathEnv, string(os.PathListSeparator))
+		}
+		return info, nil
+	})
 
-		// Initialize connection - returns sys/info plus PATH directory listings
-		"init": handler.New(func(ctx context.Context) (*InitResult, error) {
-			s.touch()
-			result := &InitResult{}
-
-			// Populate sys info
-			result.OS = runtime.GOOS
-			result.Arch = runtime.GOARCH
-			result.Pid = os.Getpid()
-			if home, err := os.UserHomeDir(); err == nil {
-				result.HomeDir = home
-			}
-			if hostname, err := os.Hostname(); err == nil {
-				result.Hostname = hostname
-			}
-			if u, err := user.Current(); err == nil {
-				result.Username = u.Username
-			}
-
-			// Split PATH into components and expand tildes
-			var pathDirs []string
-			if pathEnv := os.Getenv("PATH"); pathEnv != "" {
-				for _, dir := range strings.Split(pathEnv, string(os.PathListSeparator)) {
-					// Expand tilde to home directory for consistent cache keys
-					if strings.HasPrefix(dir, "~/") && result.HomeDir != "" {
-						dir = result.HomeDir + dir[1:]
-					} else if dir == "~" && result.HomeDir != "" {
-						dir = result.HomeDir
-					}
-					pathDirs = append(pathDirs, dir)
+	// Init
+	rpc.HandleFunc("init", func(_ json.RawMessage) (any, error) {
+		s.touch()
+		result := &InitResult{}
+		result.OS = runtime.GOOS
+		result.Arch = runtime.GOARCH
+		result.Pid = os.Getpid()
+		if home, err := os.UserHomeDir(); err == nil {
+			result.HomeDir = home
+		}
+		if hostname, err := os.Hostname(); err == nil {
+			result.Hostname = hostname
+		}
+		if u, err := user.Current(); err == nil {
+			result.Username = u.Username
+		}
+		var pathDirs []string
+		if pathEnv := os.Getenv("PATH"); pathEnv != "" {
+			for _, dir := range strings.Split(pathEnv, string(os.PathListSeparator)) {
+				if strings.HasPrefix(dir, "~/") && result.HomeDir != "" {
+					dir = result.HomeDir + dir[1:]
+				} else if dir == "~" && result.HomeDir != "" {
+					dir = result.HomeDir
 				}
-				result.Path = pathDirs
+				pathDirs = append(pathDirs, dir)
 			}
+			result.Path = pathDirs
+		}
+		result.PathDirs = make([]PathDirEntry, len(pathDirs))
+		wg := util.NewBoundedWaitGroup(32)
+		for i, dir := range pathDirs {
+			wg.Add(1)
+			go func(idx int, dirPath string) {
+				defer wg.Done()
+				entry := PathDirEntry{Path: dirPath}
+				children, err := s.fsHandler.ReadDirWithTypes(dirPath)
+				if err != nil {
+					entry.Error = err.Error()
+				} else {
+					entry.Children = &children
+				}
+				result.PathDirs[idx] = entry
+			}(i, dir)
+		}
+		wg.Wait()
+		return result, nil
+	})
 
-			// Fetch directory listings for all PATH directories in parallel
-			result.PathDirs = make([]PathDirEntry, len(pathDirs))
-			wg := util.NewBoundedWaitGroup(32)
-			for i, dir := range pathDirs {
-				wg.Add(1)
-				go func(idx int, dirPath string) {
-					defer wg.Done()
-					entry := PathDirEntry{Path: dirPath}
-					children, err := s.fsHandler.ReadDirWithTypes(dirPath)
-					if err != nil {
-						entry.Error = err.Error()
-					} else {
-						entry.Children = &children
-					}
-					result.PathDirs[idx] = entry
-				}(i, dir)
-			}
-			wg.Wait()
+	// Tunnel operations
+	flitrpc.HandleTyped(rpc, "tunnel/listen", func(params tunnel.ListenParams) (any, error) {
+		s.touch()
+		if sess.tunnelManager == nil {
+			return nil, fmt.Errorf("tunnel manager not initialized")
+		}
+		return sess.tunnelManager.Listen(params)
+	})
+	flitrpc.HandleTyped(rpc, "tunnel/close", func(params tunnel.CloseParams) (any, error) {
+		s.touch()
+		if sess.tunnelManager == nil {
+			return nil, fmt.Errorf("tunnel manager not initialized")
+		}
+		if err := sess.tunnelManager.Close(params); err != nil {
+			return nil, err
+		}
+		return map[string]bool{"ok": true}, nil
+	})
+	flitrpc.HandleTyped(rpc, "tunnel/connect", func(params tunnel.ConnectParams) (any, error) {
+		s.touch()
+		if sess.tunnelManager == nil {
+			return nil, fmt.Errorf("tunnel manager not initialized")
+		}
+		if err := sess.tunnelManager.Connect(params); err != nil {
+			return nil, err
+		}
+		return map[string]bool{"ok": true}, nil
+	})
+	flitrpc.HandleTyped(rpc, "tunnel/data", func(params tunnel.DataParams) (any, error) {
+		s.touch()
+		if sess.tunnelManager == nil {
+			return nil, fmt.Errorf("tunnel manager not initialized")
+		}
+		if err := sess.tunnelManager.SendData(params); err != nil {
+			return nil, err
+		}
+		return map[string]bool{"ok": true}, nil
+	})
+	flitrpc.HandleTyped(rpc, "tunnel/disconnect", func(params tunnel.DisconnectParams) (any, error) {
+		s.touch()
+		if sess.tunnelManager == nil {
+			return nil, fmt.Errorf("tunnel manager not initialized")
+		}
+		if err := sess.tunnelManager.Disconnect(params); err != nil {
+			return nil, err
+		}
+		return map[string]bool{"ok": true}, nil
+	})
 
-			return result, nil
-		}),
-
-		// Tunnel operations (both forward and reverse)
-		"tunnel/listen": handler.New(func(ctx context.Context, params tunnel.ListenParams) (*tunnel.ListenResult, error) {
-			s.touch()
-			if sess.tunnelManager == nil {
-				return nil, fmt.Errorf("tunnel manager not initialized")
-			}
-			return sess.tunnelManager.Listen(params)
-		}),
-		"tunnel/close": handler.New(func(ctx context.Context, params tunnel.CloseParams) (interface{}, error) {
-			s.touch()
-			if sess.tunnelManager == nil {
-				return nil, fmt.Errorf("tunnel manager not initialized")
-			}
-			if err := sess.tunnelManager.Close(params); err != nil {
-				return nil, err
-			}
-			return map[string]bool{"ok": true}, nil
-		}),
-		"tunnel/connect": handler.New(func(ctx context.Context, params tunnel.ConnectParams) (interface{}, error) {
-			s.touch()
-			if sess.tunnelManager == nil {
-				return nil, fmt.Errorf("tunnel manager not initialized")
-			}
-			if err := sess.tunnelManager.Connect(params); err != nil {
-				return nil, err
-			}
-			return map[string]bool{"ok": true}, nil
-		}),
-		"tunnel/data": handler.New(func(ctx context.Context, params tunnel.DataParams) (interface{}, error) {
-			s.touch()
-			if sess.tunnelManager == nil {
-				return nil, fmt.Errorf("tunnel manager not initialized")
-			}
-			if err := sess.tunnelManager.SendData(params); err != nil {
-				return nil, err
-			}
-			return map[string]bool{"ok": true}, nil
-		}),
-		"tunnel/disconnect": handler.New(func(ctx context.Context, params tunnel.DisconnectParams) (interface{}, error) {
-			s.touch()
-			if sess.tunnelManager == nil {
-				return nil, fmt.Errorf("tunnel manager not initialized")
-			}
-			if err := sess.tunnelManager.Disconnect(params); err != nil {
-				return nil, err
-			}
-			return map[string]bool{"ok": true}, nil
-		}),
-
-		// Shutdown - delay exit to allow in-flight RPCs to complete
-		"shutdown": handler.New(func(ctx context.Context) (interface{}, error) {
-			sess.Logger().Info("shutdown RPC received, exiting in 5s")
-			go func() {
-				time.Sleep(5 * time.Second)
-				s.Shutdown()
-			}()
-			return map[string]bool{"ok": true}, nil
-		}),
-	}
-}
-
-// serverOptions returns jrpc2 server options
-func (s *Server) serverOptions() *jrpc2.ServerOptions {
-	opts := &jrpc2.ServerOptions{
-		AllowPush: true, // Enable server-to-client notifications
-	}
-	if s.verbose {
-		opts.Logger = jrpc2.StdLogger(log.Default())
-	}
-	return opts
+	// Shutdown
+	rpc.HandleFunc("shutdown", func(_ json.RawMessage) (any, error) {
+		sess.Logger().Info("shutdown RPC received, exiting in 5s")
+		go func() {
+			time.Sleep(5 * time.Second)
+			s.Shutdown()
+		}()
+		return map[string]bool{"ok": true}, nil
+	})
 }
 
 // HandleConnection handles a single TCP client connection
@@ -1334,14 +1259,14 @@ func (s *Server) HandleConnection(conn net.Conn) {
 	aw := newAsyncWriter(conn)
 	defer aw.Close()
 
-	// Create channel with LSP framing (Content-Length headers)
-	ch := channel.Header("")(conn, aw)
+	// Create flitrpc server
+	rpc := flitrpc.NewServer(conn, aw, slog.Default())
+	s.registerHandlers(rpc, sess)
+	sess.SetNotifier(func(ctx context.Context, method string, params any) error {
+		return rpc.Notify(method, params)
+	})
 
-	// Create and start the jrpc2 server
-	srv := jrpc2.NewServer(s.buildHandlerMap(sess), s.serverOptions())
-	sess.SetServer(srv)
-
-	// Initialize Eden watcher after SetServer so it can use the session logger
+	// Initialize Eden watcher after SetNotifier so it can use the session logger
 	sess.InitEdenWatcher(s.fsHandler)
 
 	sess.Logger().Info("Connection established", "remote", conn.RemoteAddr().String())
@@ -1349,12 +1274,11 @@ func (s *Server) HandleConnection(conn net.Conn) {
 	// Run until connection closes or server shuts down
 	go func() {
 		<-s.done
-		srv.Stop()
+		conn.Close()
 	}()
 
-	srv.Start(ch)
-	if err := srv.Wait(); err != nil {
-		sess.Logger().Error("Server error", "error", err)
+	if err := rpc.Serve(); err != nil {
+		sess.Logger().Info("Connection ended", "error", err)
 	}
 }
 
@@ -1362,45 +1286,41 @@ func (s *Server) HandleConnection(conn net.Conn) {
 type ReadyMessage struct {
 	FlitReady bool   `json:"flit_ready"`
 	Version   string `json:"version"`
+	Protocol  string `json:"protocol,omitempty"`
 }
 
-// HandleStdio handles JSON-RPC over stdin/stdout
+// HandleStdio handles flitrpc over stdin/stdout
 func (s *Server) HandleStdio(stdin io.Reader, stdout io.Writer) {
 	sess := NewSession(s.logLevel)
 	defer sess.Close()
 
 	if err := sess.InitWatcher(s.fsHandler); err != nil {
-		// In stdio mode, only log fatal errors to stderr
 		fmt.Fprintf(os.Stderr, "Failed to init watcher: %v\n", err)
 	}
 
-	// Send ready message as JSON line (not Content-Length framed)
-	// This allows the client to detect when the server is ready
-	readyMsg := ReadyMessage{FlitReady: true, Version: "1.0"}
+	// Send ready message as JSON line (pre-protocol)
+	readyMsg := ReadyMessage{FlitReady: true, Version: "2.0", Protocol: "flitrpc"}
 	readyBytes, _ := json.Marshal(readyMsg)
 	stdout.Write(readyBytes)
 	stdout.Write([]byte("\n"))
 
-	// Wrap stdout with async buffer so jrpc2 writes don't block on
-	// slow pipes/transports (prevents mutex-held-during-write deadlocks).
+	// Wrap stdout with async buffer to prevent bidirectional pipe deadlocks
 	aw := newAsyncWriter(stdout)
 	defer aw.Close()
 
-	// Create channel with Content-Length framing (no Content-Type header)
-	// We need a WriteCloser, so wrap stdout
-	ch := channel.Header("")(stdin, writeCloser{aw})
+	// Create flitrpc server
+	rpc := flitrpc.NewServer(stdin, aw, slog.Default())
+	s.registerHandlers(rpc, sess)
+	sess.SetNotifier(func(ctx context.Context, method string, params any) error {
+		return rpc.Notify(method, params)
+	})
 
-	// Create and start the jrpc2 server
-	srv := jrpc2.NewServer(s.buildHandlerMap(sess), s.serverOptions())
-	sess.SetServer(srv)
-
-	// Initialize Eden watcher after SetServer so it can use the session logger
+	// Initialize Eden watcher after SetNotifier so it can use the session logger
 	sess.InitEdenWatcher(s.fsHandler)
 
-	// Sync heartbeat: periodically send a request and wait for response
-	// - If network is down, this blocks until it comes back (that's fine)
-	// - If connection is truly broken (client exited), we get ErrConnClosed and exit
-	// - We don't use timeouts because we want to survive temporary network outages
+	sess.Logger().Info("Connection established", "mode", "stdio", "protocol", "flitrpc")
+
+	// Heartbeat: periodically send request and wait for response
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -1408,11 +1328,10 @@ func (s *Server) HandleStdio(stdin io.Reader, stdout io.Writer) {
 			select {
 			case <-s.done:
 				return
+			case <-rpc.Done():
+				return
 			case <-ticker.C:
-				// Send heartbeat request and wait for response (no timeout)
-				_, err := srv.Callback(context.Background(), "heartbeat", nil)
-				if err != nil {
-					srv.Stop()
+				if _, err := rpc.SendRequest("heartbeat", nil); err != nil {
 					return
 				}
 			}
@@ -1422,14 +1341,12 @@ func (s *Server) HandleStdio(stdin io.Reader, stdout io.Writer) {
 	// Run until stdin closes or server shuts down
 	go func() {
 		<-s.done
-		srv.Stop()
-		// srv.Wait() blocks on stdin.Read() which can't be interrupted
-		// by closing the fd on Linux. Force exit after Stop().
 		os.Exit(0)
 	}()
 
-	srv.Start(ch)
-	srv.Wait()
+	if err := rpc.Serve(); err != nil {
+		sess.Logger().Info("Server exited", "error", err)
+	}
 }
 
 // writeCloser wraps an io.Writer to satisfy io.WriteCloser

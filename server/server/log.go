@@ -25,7 +25,7 @@ import (
 // RPCLogHandler is a slog handler that sends logs via JSON-RPC notifications
 type RPCLogHandler struct {
 	level  slog.Leveler
-	notify func(method string, params any) error
+	notify func(ctx context.Context, method string, params any) error
 	attrs  []slog.Attr
 	groups []string
 }
@@ -39,7 +39,7 @@ type LogNotification struct {
 }
 
 // NewRPCLogHandler creates a new handler that sends logs via RPC
-func NewRPCLogHandler(level slog.Leveler, notify func(method string, params any) error) *RPCLogHandler {
+func NewRPCLogHandler(level slog.Leveler, notify func(ctx context.Context, method string, params any) error) *RPCLogHandler {
 	return &RPCLogHandler{
 		level:  level,
 		notify: notify,
@@ -50,7 +50,7 @@ func (h *RPCLogHandler) Enabled(_ context.Context, level slog.Level) bool {
 	return level >= h.level.Level()
 }
 
-func (h *RPCLogHandler) Handle(_ context.Context, r slog.Record) error {
+func (h *RPCLogHandler) Handle(ctx context.Context, r slog.Record) error {
 	attrs := make(map[string]any)
 
 	// Add pre-stored attrs
@@ -73,7 +73,7 @@ func (h *RPCLogHandler) Handle(_ context.Context, r slog.Record) error {
 		notification.Attrs = attrs
 	}
 
-	return h.notify("log", notification)
+	return h.notify(ctx, "log", notification)
 }
 
 func (h *RPCLogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
