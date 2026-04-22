@@ -16,6 +16,7 @@
 package tunnel
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -26,7 +27,7 @@ import (
 )
 
 // NotifyFunc is called to send notifications to the client.
-type NotifyFunc func(method string, params any) error
+type NotifyFunc func(ctx context.Context, method string, params any) error
 
 // Manager handles tunnel listeners and connections for both directions.
 type Manager struct {
@@ -266,7 +267,7 @@ func (l *Listener) acceptLoop() {
 		l.manager.mu.Unlock()
 
 		// Notify client of new connection
-		l.manager.notify("tunnel/accept", map[string]string{
+		l.manager.notify(context.Background(), "tunnel/accept", map[string]string{
 			"tunnelId": l.ID,
 			"connId":   connID,
 		})
@@ -294,7 +295,7 @@ func (c *Connection) readLoop() {
 		n, err := c.conn.Read(buf)
 		if n > 0 {
 			encoded := base64.StdEncoding.EncodeToString(buf[:n])
-			c.manager.notify("tunnel/data", map[string]string{
+			c.manager.notify(context.Background(), "tunnel/data", map[string]string{
 				"tunnelId": c.TunnelID,
 				"connId":   c.ID,
 				"data":     encoded,
@@ -319,7 +320,7 @@ func (c *Connection) cleanup() {
 	delete(c.manager.conns, c.ID)
 	c.manager.mu.Unlock()
 
-	c.manager.notify("tunnel/disconnect", map[string]string{
+	c.manager.notify(context.Background(), "tunnel/disconnect", map[string]string{
 		"tunnelId": c.TunnelID,
 		"connId":   c.ID,
 	})
