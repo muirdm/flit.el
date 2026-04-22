@@ -124,7 +124,7 @@ Returns the predicate result, or nil if timeout was reached."
       ;; Accept process output from flit connection
       (let ((conn (gethash flit-test--host flit--connections)))
         (if conn
-            (accept-process-output (jsonrpc--process conn) interval)
+            (accept-process-output (flit-conn-process conn) interval)
           ;; No connection yet, just sleep
           (sleep-for interval))))
     result))
@@ -614,7 +614,7 @@ Must be called with the target buffer current."
           (let ((start (float-time)))
             (while (and (process-live-p proc)
                         (< (- (float-time) start) 2))
-              (accept-process-output (jsonrpc--process conn) 0.1)))))
+              (accept-process-output (flit-conn-process conn) 0.1)))))
       ;; Check we got output
       (should (string-match-p "hello" output))
       (should (string-match-p "world" output)))))
@@ -634,7 +634,7 @@ Must be called with the target buffer current."
                 (let ((start (float-time)))
                   (while (and (process-live-p proc)
                               (< (- (float-time) start) 2))
-                    (accept-process-output (jsonrpc--process conn) 0.1)))))
+                    (accept-process-output (flit-conn-process conn) 0.1)))))
             ;; Check buffer has output
             (with-current-buffer buf
               (should (string-match-p "buffered" (buffer-string)))))
@@ -701,7 +701,7 @@ Must be called with the target buffer current."
                           (with-current-buffer buf
                             (not (string-match-p "hello-pty" (buffer-string)))))
                 (when conn
-                  (accept-process-output (jsonrpc--process conn) 0.1))))
+                  (accept-process-output (flit-conn-process conn) 0.1))))
             ;; Check we got output
             (with-current-buffer buf
               (should (string-match-p "hello-pty" (buffer-string)))))
@@ -732,7 +732,7 @@ Must be called with the target buffer current."
                           (with-current-buffer buf
                             (not (string-match-p "hello from input" (buffer-string)))))
                 (when conn
-                  (accept-process-output (jsonrpc--process conn) 0.1))))
+                  (accept-process-output (flit-conn-process conn) 0.1))))
             ;; Check we got the echo back
             (with-current-buffer buf
               (should (string-match-p "hello from input" (buffer-string)))))
@@ -765,7 +765,7 @@ Must be called with the target buffer current."
               (while (and (< (- (float-time) start) 2)
                           (null exit-code))
                 (when conn
-                  (accept-process-output (jsonrpc--process conn) 0.1))))
+                  (accept-process-output (flit-conn-process conn) 0.1))))
             ;; Check exit code
             (should (eq exit-code 42)))
         (when (and proc (process-live-p proc))
@@ -790,7 +790,7 @@ Must be called with the target buffer current."
             ;; Give a moment for the async request
             (let ((conn (gethash "test" flit--connections)))
               (when conn
-                (accept-process-output (jsonrpc--process conn) 0.2)))
+                (accept-process-output (flit-conn-process conn) 0.2)))
             ;; Just verify no error occurred
             (should t))
         (when (and proc (process-live-p proc))
@@ -819,7 +819,7 @@ Must be called with the target buffer current."
                           (with-current-buffer buf
                             (= (buffer-size) 0)))
                 (when conn
-                  (accept-process-output (jsonrpc--process conn) 0.1))))
+                  (accept-process-output (flit-conn-process conn) 0.1))))
             ;; Check output
             (with-current-buffer buf
               (should (string-match-p "hello world" (buffer-string)))))
@@ -847,7 +847,7 @@ Must be called with the target buffer current."
                           (with-current-buffer buf
                             (not (string-match-p "got: test input line" (buffer-string)))))
                 (when conn
-                  (accept-process-output (jsonrpc--process conn) 0.1))))
+                  (accept-process-output (flit-conn-process conn) 0.1))))
             ;; Check output echoes input
             (with-current-buffer buf
               (should (string-match-p "got: test input line" (buffer-string)))))
@@ -871,7 +871,7 @@ Must be called with the target buffer current."
               (while (and (< (- (float-time) start) 3)
                           (not (process-get proc 'flit-exit-code)))
                 (when conn
-                  (accept-process-output (jsonrpc--process conn) 0.1))))
+                  (accept-process-output (flit-conn-process conn) 0.1))))
             ;; Check exit code
             (should (= (process-exit-status proc) 7)))
         (when (process-live-p proc)
@@ -898,7 +898,7 @@ Must be called with the target buffer current."
                 (while (and (< (- (float-time) start) 2)
                             (not (process-get proc 'flit-exit-code)))
                   (when conn
-                    (accept-process-output (jsonrpc--process conn) 0.1))))
+                    (accept-process-output (flit-conn-process conn) 0.1))))
               ;; Process should have exited (signal causes non-zero exit)
               (should (process-get proc 'flit-exit-code))))
         (when (process-live-p proc)
@@ -933,7 +933,7 @@ Must be called with the target buffer current."
                                 (with-current-buffer buf
                                   (not (string-match-p "CUSTOM=" (buffer-string)))))
                       (when conn
-                        (accept-process-output (jsonrpc--process conn) 0.1))))
+                        (accept-process-output (flit-conn-process conn) 0.1))))
                   (with-current-buffer buf
                     (let ((output (buffer-string)))
                       ;; Custom var should be propagated
@@ -1367,7 +1367,7 @@ After listing a directory, file-attributes on entries should use cache."
     ;; Wait for async entryInfo notification to arrive
     (let ((conn (gethash "test" flit--connections)))
       (when conn
-        (accept-process-output (jsonrpc--process conn) 0.5)))
+        (accept-process-output (flit-conn-process conn) 0.5)))
     ;; Now count RPCs when getting file-attributes for each entry
     (let* ((rpc-count 0)
            (orig-send-request (symbol-function 'flit--send-request)))
@@ -1437,7 +1437,7 @@ Creating a file should update the parent directory listing."
     ;; Accept process output to receive notification
     (let ((conn (gethash "test" flit--connections)))
       (when conn
-        (accept-process-output (jsonrpc--process conn) 0.5)))
+        (accept-process-output (flit-conn-process conn) 0.5)))
     ;; List directory again - should see the new file
     (let ((entries (directory-files (flit-test--path "newfiledir"))))
       (should (member "existing.txt" entries))
@@ -1466,7 +1466,7 @@ Creating a file should update the parent directory listing."
               (while (and (< (- (float-time) start) 3)
                           (null sentinel-event))
                 (when conn
-                  (accept-process-output (jsonrpc--process conn) 0.1))))
+                  (accept-process-output (flit-conn-process conn) 0.1))))
             ;; Sentinel should have been called
             (should sentinel-event)
             ;; Exit code should be captured
@@ -1621,7 +1621,7 @@ the process we asked about, not just any output on the connection."
             (set-process-sentinel proc (lambda (_p _event) (setq sentinel-called t)))
             ;; Get the connection process and kill it to simulate crash
             (let* ((conn (gethash flit-test--host flit--connections))
-                   (conn-proc (and conn (jsonrpc--process conn))))
+                   (conn-proc (and conn (flit-conn-process conn))))
               (should conn-proc)
               ;; Kill the connection process
               (delete-process conn-proc)
@@ -2112,8 +2112,7 @@ buffer in an unmodified state even though content differed from disk."
     (flit-test--create-file "raw-test/b.txt" "b")
     ;; Make raw RPC call (bypassing flit--get-info caching)
     (flit--with-parsed (host path) (flit-test--path "raw-test")
-      (let* ((conn (flit--get-connection host))
-             (result (jsonrpc-request conn "fs/info" `(:path ,path))))
+      (let* ((result (flit--send-request host "fs/info" `(:path ,path))))
         ;; Log the result keys for debugging
         (message "Raw fs/info result keys: %S"
                  (cl-loop for (k _v) on result by #'cddr collect k))
@@ -2477,7 +2476,7 @@ file changes should be reflected in the buffer."
                           (with-current-buffer buf
                             (not (string-match-p "async-output" (buffer-string)))))
                 (when conn
-                  (accept-process-output (jsonrpc--process conn) 0.1))))
+                  (accept-process-output (flit-conn-process conn) 0.1))))
             (with-current-buffer buf
               (should (string-match-p "async-output" (buffer-string)))))
         (when-let* ((proc (get-buffer-process buf)))

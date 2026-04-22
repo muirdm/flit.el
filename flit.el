@@ -443,7 +443,7 @@ flit-connect) needed to reconnect."
             (let* ((state (flit--connection-state host))
                    (conn (gethash host flit--connections))
                    (alive (and conn (flit--connection-alive-p host)))
-                   (proc (and conn (jsonrpc--process conn)))
+                   (proc (and conn (flit-conn-process conn)))
                    (method-chain (and (processp proc) (process-get proc 'flit-method)))
                    (sys-info (gethash host flit--sys-info))
                    (os (plist-get sys-info :os))
@@ -478,18 +478,18 @@ Also notifies connected servers to clear their cache state."
       (progn
         (flit--cache-invalidate-host host)
         ;; Notify server to clear its cache state
-        (when-let ((conn (gethash host flit--connections)))
+        (when (gethash host flit--connections)
           (flit--with-quit-log (format "clearCache RPC to %s" host)
             (condition-case nil
-                (jsonrpc-request conn "session/clearCache" nil :timeout 5)
+                (flit--send-request host "session/clearCache" nil 5)
               (error nil)))))
     (let ((count (hash-table-count flit--cache)))
       (clrhash flit--cache)
       ;; Notify all connected servers
-      (maphash (lambda (host conn)
+      (maphash (lambda (host _conn)
                  (flit--with-quit-log (format "clearCache RPC to %s" host)
                    (condition-case nil
-                       (jsonrpc-request conn "session/clearCache" nil :timeout 5)
+                       (flit--send-request host "session/clearCache" nil 5)
                      (error nil))))
                flit--connections)
       (message "[flit] Cleared %d cache entries" count))))
@@ -979,7 +979,7 @@ hash lookup instead of flit--get-connection to avoid side effects."
                (orig-conn-proc (process-get proc 'flit-conn-proc))
                ;; Direct lookup - do NOT use flit--get-connection which triggers reconnect
                (curr-conn (and host (gethash host flit--connections)))
-               (curr-conn-proc (and curr-conn (jsonrpc--process curr-conn))))
+               (curr-conn-proc (and curr-conn (flit-conn-process curr-conn))))
           (cond
            ((null orig-conn-proc)
             ;; Old process without conn tracking - allow only if connection is alive
@@ -1002,8 +1002,7 @@ hash lookup instead of flit--get-connection to avoid side effects."
 (defun flit--process-send-string-advice (orig-fn proc string)
   "Send STRING to flit process PROC via exec/input, or call ORIG-FN."
   (if-let* ((proc-id (flit--process-valid-for-rpc-p proc "send"))
-            (host (process-get proc 'flit-host))
-            (conn (flit--get-connection host)))
+            (host (process-get proc 'flit-host)))
       (let ((idx (or (process-get proc 'flit-input-idx) 0))
             ;; json-serialize requires multibyte strings. LSP messages containing
             ;; non-ASCII may be unibyte if lsp-mode encoded them for the wire.
@@ -1016,8 +1015,8 @@ hash lookup instead of flit--get-connection to avoid side effects."
         (process-put proc 'flit-input-idx (1+ idx))
         (flit--log-debug "process-send-string: proc-id=%s idx=%d len=%d"
                          proc-id idx (length string))
-        (jsonrpc-notify conn "exec/input"
-                        `(:procId ,proc-id :data ,data :idx ,idx)))
+        (flit--send-notify host "exec/input"
+                           `(:procId ,proc-id :data ,data :idx ,idx)))
     (funcall orig-fn proc string)))
 
 (advice-add 'process-send-string :around #'flit--process-send-string-advice)
@@ -1049,7 +1048,7 @@ process receives output, or until timeout expires."
              (conn (condition-case nil
                        (and host (flit--get-connection host))
                      (error nil)))
-             (conn-proc (and conn (jsonrpc--process conn))))
+             (conn-proc (and conn (flit-conn-process conn))))
         (if conn-proc
             ;; Flit process with active connection - poll until THIS process gets output
             (let* ((output-count-before (or (process-get process 'flit-output-count) 0))
@@ -1237,6 +1236,14 @@ Port is included in HOST as host:port when present."
   ((host :initarg :host :accessor flit-connection-host))
   "A JSON-RPC connection to a flit server.")
 
+(defun flit-conn-process (conn)
+  "Return the underlying Emacs process for CONN."
+  (jsonrpc--process conn))
+
+(defun flit-conn-running-p (conn)
+  "Return non-nil if CONN is running."
+  (jsonrpc-running-p conn))
+
 (defun flit--await (async-fn)
   "Drive ASYNC-FN synchronously, waiting for its callback.
 ASYNC-FN is called with a single callback argument.
@@ -1299,8 +1306,8 @@ ERROR-MSG is logged but does not affect the state."
   "Return non-nil if the connection to HOST is alive."
   (let ((conn (gethash host flit--connections)))
     (and conn
-         (jsonrpc-running-p conn)
-         (let ((proc (jsonrpc--process conn)))
+         (flit-conn-running-p conn)
+         (let ((proc (flit-conn-process conn)))
            (and proc (process-live-p proc))))))
 
 (define-error 'flit-disconnected "Not connected to flit host")
@@ -1455,7 +1462,7 @@ Defaults to `passive' when `flit--connection-tier' is unbound.
     (flit--set-connection-state host 'pending)
     ;; Kill the underlying process (et-bridge, ssh, etc.) to ensure
     ;; the remote flit-server receives EOF and exits
-    (when-let* ((proc (jsonrpc--process conn)))
+    (when-let* ((proc (flit-conn-process conn)))
       (when (process-live-p proc)
         (flit--log-info "Killing process for %s" host)
         ;; Send EOF first to allow graceful shutdown
@@ -2212,10 +2219,8 @@ Marks them as exited, calls their sentinels, and deletes them."
 (defun flit--send-shutdown (host)
   "Send shutdown RPC to HOST.  Fire-and-forget; errors are ignored."
   (condition-case nil
-      (let ((conn (gethash host flit--connections)))
-        (when conn
-          (with-timeout (1 nil)
-            (jsonrpc-notify conn "shutdown" nil))))
+      (with-timeout (1 nil)
+        (flit--send-notify host "shutdown" nil))
     (error nil)))
 
 (defun flit--close-connection (host)
@@ -2228,7 +2233,7 @@ Marks them as exited, calls their sentinels, and deletes them."
     (when conn
       (remhash host flit--connections)
       (remhash host flit--sys-info)
-      (let ((proc (jsonrpc--process conn)))
+      (let ((proc (flit-conn-process conn)))
         (when (and proc (process-live-p proc))
           ;; Close stdin to signal server to exit gracefully
           (process-send-eof proc)
@@ -2571,13 +2576,14 @@ PARAMS contains :procId and :exitCode."
 (defun flit--check-jsonrpc-buffer (conn)
   "Check if the jsonrpc process buffer has unparsable data stuck at point.
 If so, log the stuck data to help diagnose hangs."
-  (when-let* ((proc (jsonrpc--process conn))
+  (when-let* ((proc (flit-conn-process conn))
               (buf (process-buffer proc)))
     (when (buffer-live-p buf)
       (with-current-buffer buf
         (let ((unprocessed (- (position-bytes (process-mark proc))
                               (position-bytes (point))))
-              (expected (jsonrpc--expected-bytes conn)))
+              (expected (and (fboundp 'jsonrpc--expected-bytes)
+                            (jsonrpc--expected-bytes conn))))
           (when (> unprocessed 0)
             (let ((head (buffer-substring-no-properties
                          (point) (min (+ (point) 200) (point-max)))))
@@ -2651,6 +2657,13 @@ ERROR-FN is called with the error on failure."
     (jsonrpc-async-request conn method params
                            :success-fn (or success-fn #'ignore)
                            :error-fn (or error-fn #'ignore))))
+
+(defun flit--send-notify (host method params)
+  "Send a JSON-RPC notification to HOST (fire-and-forget).
+METHOD is the RPC method name, PARAMS is a plist of parameters."
+  (let ((conn (flit--get-connection host)))
+    (when conn
+      (jsonrpc-notify conn method params))))
 
 ;;; File operations
 
@@ -2819,15 +2832,12 @@ Fire-and-forget call to fs/openDir, which triggers async child entry fetch
 with higher limit (10k vs 1k default). Used by find-file and dired."
   (condition-case nil
       (flit--with-parsed (host path) filename
-        (when-let ((conn (flit--get-connection host)))
-          (flit--log-info "RPC fs/openDir (async): %s" path)
-          ;; Fire-and-forget: use async request, ignore result
-          (jsonrpc-async-request conn "fs/openDir" `(:path ,path)
-                                 :success-fn (lambda (_result)
-                                               (flit--log-debug "fs/openDir complete: %s" path))
-                                 :error-fn (lambda (err)
-                                             (flit--log-debug "fs/openDir error: %s - %s" path err))
-                                 :timeout 30)))
+        (flit--log-info "RPC fs/openDir (async): %s" path)
+        (flit--send-request-async host "fs/openDir" `(:path ,path)
+                                  (lambda (_result)
+                                    (flit--log-debug "fs/openDir complete: %s" path))
+                                  (lambda (err)
+                                    (flit--log-debug "fs/openDir error: %s - %s" path err))))
     (error nil)))  ; Silently ignore errors - this is best-effort
 
 (defun flit--format-mode-string (mode is-dir)
@@ -2990,7 +3000,7 @@ Returns an Emacs process object."
     ;; the new connection will have a different process object
     (let ((conn (flit--get-connection host)))
       (when conn
-        (process-put proc 'flit-conn-proc (jsonrpc--process conn))))
+        (process-put proc 'flit-conn-proc (flit-conn-process conn))))
     ;; Build remaining params
     (when cwd
       (setq params (plist-put params :cwd cwd)))
@@ -5180,9 +5190,8 @@ Each tunnel state is a plist with:
 TUNNEL-ID is an optional unique identifier for the tunnel.
 Returns a plist with :tunnel-id and :remote-port."
   (let* ((tunnel-id (or tunnel-id (format "tunnel-%s-%d" host local-port)))
-         (conn (flit--get-connection host))
-         (result (jsonrpc-request conn "tunnel/listen"
-                                  `(:tunnelId ,tunnel-id :port 0))))
+         (result (flit--send-request host "tunnel/listen"
+                                     `(:tunnelId ,tunnel-id :port 0))))
     (let ((remote-port (plist-get result :port)))
       (puthash tunnel-id
                (list :direction 'reverse
@@ -5327,8 +5336,8 @@ A new client has connected to a remote tunnel listener."
 (defun flit--tunnel-send-data (host conn-id data)
   "Send DATA from local connection CONN-ID to the remote via HOST."
   (let ((encoded (base64-encode-string data t)))
-    (jsonrpc-notify (flit--get-connection host) "tunnel/data"
-                    `(:connId ,conn-id :data ,encoded))))
+    (flit--send-notify host "tunnel/data"
+                       `(:connId ,conn-id :data ,encoded))))
 
 (defun flit--tunnel-local-disconnected (tunnel-id conn-id)
   "Handle local connection CONN-ID in tunnel TUNNEL-ID being closed."
