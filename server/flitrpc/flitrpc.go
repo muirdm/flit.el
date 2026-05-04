@@ -190,6 +190,10 @@ type Server struct {
 	logger   *slog.Logger
 	done     chan struct{}
 
+	// Server-initiated request support (heartbeat).
+	callbackMu      sync.Mutex
+	callbackWaiters map[int64]chan *Frame
+
 	// RequestHandler is called for client->server requests not in the handler map.
 	// If nil, unknown methods return an error.
 	RequestHandler func(method string, params msgpack.RawMessage, payload []byte) (any, []byte, error)
@@ -198,11 +202,12 @@ type Server struct {
 // NewServer creates a server reading from r and writing to w.
 func NewServer(r io.Reader, w io.Writer, logger *slog.Logger) *Server {
 	return &Server{
-		reader:   bufio.NewReaderSize(r, 256*1024),
-		writer:   NewWriter(w),
-		handlers: make(map[string]Handler),
-		logger:   logger,
-		done:     make(chan struct{}),
+		reader:          bufio.NewReaderSize(r, 256*1024),
+		writer:          NewWriter(w),
+		handlers:        make(map[string]Handler),
+		logger:          logger,
+		done:            make(chan struct{}),
+		callbackWaiters: make(map[int64]chan *Frame),
 	}
 }
 
@@ -399,33 +404,28 @@ func (s *Server) sendError(id int64, code int, message string) {
 	}
 }
 
-// Heartbeat support: server sends request, client responds.
-var (
-	callbackMu       sync.Mutex
-	callbackWaiters  = make(map[int64]chan *Frame)
-)
-
 func (s *Server) handleCallbackResponse(frame *Frame) {
-	callbackMu.Lock()
-	ch, ok := callbackWaiters[frame.Meta.ID]
-	callbackMu.Unlock()
+	s.callbackMu.Lock()
+	ch, ok := s.callbackWaiters[frame.Meta.ID]
+	s.callbackMu.Unlock()
 	if ok {
 		ch <- frame
 	}
 }
 
 // SendRequest sends a request to the client and waits for a response.
+// Blocks until the client responds or the server's Done channel closes.
 func (s *Server) SendRequest(method string, params any) (any, error) {
 	id := s.nextID.Add(1)
 
 	ch := make(chan *Frame, 1)
-	callbackMu.Lock()
-	callbackWaiters[id] = ch
-	callbackMu.Unlock()
+	s.callbackMu.Lock()
+	s.callbackWaiters[id] = ch
+	s.callbackMu.Unlock()
 	defer func() {
-		callbackMu.Lock()
-		delete(callbackWaiters, id)
-		callbackMu.Unlock()
+		s.callbackMu.Lock()
+		delete(s.callbackWaiters, id)
+		s.callbackMu.Unlock()
 	}()
 
 	metaMap := map[string]any{
@@ -442,9 +442,13 @@ func (s *Server) SendRequest(method string, params any) (any, error) {
 		return nil, err
 	}
 
-	resp := <-ch
-	if resp.Meta.Error != nil {
-		return nil, fmt.Errorf("%s", resp.Meta.Error.Message)
+	select {
+	case resp := <-ch:
+		if resp.Meta.Error != nil {
+			return nil, fmt.Errorf("%s", resp.Meta.Error.Message)
+		}
+		return resp.Meta.Result, nil
+	case <-s.done:
+		return nil, fmt.Errorf("connection closed")
 	}
-	return resp.Meta.Result, nil
 }
