@@ -18,6 +18,8 @@ package server
 import (
 	"context"
 	"encoding/json"
+
+	"github.com/vmihailenco/msgpack/v5"
 	"fmt"
 	"io"
 	"log"
@@ -898,9 +900,9 @@ func (sess *Session) Close() {
 // registerHandlers registers all RPC handlers with a flitrpc server.
 // Handler logic is shared with buildHandlerMap above.
 func (s *Server) registerHandlers(rpc *flitrpc.Server, sess *Session) {
-	// Simple handlers: take json.RawMessage, return (any, error)
-	simple := func(method string, fn func(json.RawMessage) (interface{}, error)) {
-		rpc.HandleFunc(method, func(params json.RawMessage) (any, error) {
+	// Simple handlers: take raw msgpack params, return (any, error)
+	simple := func(method string, fn func([]byte) (interface{}, error)) {
+		rpc.HandleFunc(method, func(params msgpack.RawMessage) (any, error) {
 			s.touch()
 			return fn(params)
 		})
@@ -921,11 +923,11 @@ func (s *Server) registerHandlers(rpc *flitrpc.Server, sess *Session) {
 	simple("fs/copy-dir", s.fsHandler.CopyDir)
 
 	// fs/write needs special handling for mtime suppression
-	rpc.HandleFunc("fs/write", func(params json.RawMessage) (any, error) {
+	rpc.HandleFunc("fs/write", func(params msgpack.RawMessage) (any, error) {
 		s.touch()
 		startTime := time.Now()
 		var p fs.WriteParams
-		if err := json.Unmarshal(params, &p); err != nil {
+		if err := flitrpc.UnmarshalParams(params, &p); err != nil {
 			return nil, fmt.Errorf("invalid params: %w", err)
 		}
 		sess.UpdateFileState(p.Path, time.Now().Unix(), int64(len(p.Content)))
@@ -1047,7 +1049,7 @@ func (s *Server) registerHandlers(rpc *flitrpc.Server, sess *Session) {
 	})
 
 	// Session
-	rpc.HandleFunc("session/clearCache", func(_ json.RawMessage) (any, error) {
+	rpc.HandleFunc("session/clearCache", func(_ msgpack.RawMessage) (any, error) {
 		s.touch()
 		sess.ClearCacheState()
 		return map[string]interface{}{"ok": true}, nil
@@ -1105,7 +1107,7 @@ func (s *Server) registerHandlers(rpc *flitrpc.Server, sess *Session) {
 	})
 
 	// System info
-	rpc.HandleFunc("sys/info", func(_ json.RawMessage) (any, error) {
+	rpc.HandleFunc("sys/info", func(_ msgpack.RawMessage) (any, error) {
 		s.touch()
 		info := &SysInfo{
 			OS:   runtime.GOOS,
@@ -1128,7 +1130,7 @@ func (s *Server) registerHandlers(rpc *flitrpc.Server, sess *Session) {
 	})
 
 	// Init
-	rpc.HandleFunc("init", func(_ json.RawMessage) (any, error) {
+	rpc.HandleFunc("init", func(_ msgpack.RawMessage) (any, error) {
 		s.touch()
 		result := &InitResult{}
 		result.OS = runtime.GOOS
@@ -1225,7 +1227,7 @@ func (s *Server) registerHandlers(rpc *flitrpc.Server, sess *Session) {
 	})
 
 	// Shutdown
-	rpc.HandleFunc("shutdown", func(_ json.RawMessage) (any, error) {
+	rpc.HandleFunc("shutdown", func(_ msgpack.RawMessage) (any, error) {
 		sess.Logger().Info("shutdown RPC received, exiting in 5s")
 		go func() {
 			time.Sleep(5 * time.Second)

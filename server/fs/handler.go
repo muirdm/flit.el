@@ -16,8 +16,7 @@
 package fs
 
 import (
-
-	"encoding/json"
+	"bytes"
 	"fmt"
 	"io"
 	"log/slog"
@@ -31,7 +30,16 @@ import (
 	"time"
 
 	"github.com/muirdm/flit.el/util"
+	"github.com/vmihailenco/msgpack/v5"
 )
+
+// decodeParams unmarshals raw msgpack bytes into a typed struct.
+// Uses json struct tags since Go structs have json:"..." tags.
+func decodeParams(raw []byte, v any) error {
+	dec := msgpack.NewDecoder(bytes.NewReader(raw))
+	dec.SetCustomStructTag("json")
+	return dec.Decode(v)
+}
 
 // strPtr returns a pointer to a string (helper for optional string fields)
 func strPtr(s string) *string {
@@ -88,9 +96,9 @@ type StatResult struct {
 }
 
 // Stat returns file information
-func (h *Handler) Stat(params json.RawMessage) (interface{}, error) {
+func (h *Handler) Stat(params []byte) (interface{}, error) {
 	var p StatParams
-	if err := json.Unmarshal(params, &p); err != nil {
+	if err := decodeParams(params, &p); err != nil {
 		return nil, &RPCError{Code: InvalidParams, Message: "Invalid params", Data: err.Error()}
 	}
 
@@ -223,9 +231,9 @@ type ReadResult struct {
 }
 
 // Read reads file contents and returns it along with fresh stat info
-func (h *Handler) Read(params json.RawMessage) (interface{}, error) {
+func (h *Handler) Read(params []byte) (interface{}, error) {
 	var p ReadParams
-	if err := json.Unmarshal(params, &p); err != nil {
+	if err := decodeParams(params, &p); err != nil {
 		return nil, &RPCError{Code: InvalidParams, Message: "Invalid params", Data: err.Error()}
 	}
 
@@ -441,9 +449,9 @@ type MkdirParams struct {
 }
 
 // Mkdir creates a directory
-func (h *Handler) Mkdir(params json.RawMessage) (interface{}, error) {
+func (h *Handler) Mkdir(params []byte) (interface{}, error) {
 	var p MkdirParams
-	if err := json.Unmarshal(params, &p); err != nil {
+	if err := decodeParams(params, &p); err != nil {
 		return nil, &RPCError{Code: InvalidParams, Message: "Invalid params", Data: err.Error()}
 	}
 
@@ -468,9 +476,9 @@ type DeleteParams struct {
 }
 
 // Delete deletes a file or directory
-func (h *Handler) Delete(params json.RawMessage) (interface{}, error) {
+func (h *Handler) Delete(params []byte) (interface{}, error) {
 	var p DeleteParams
-	if err := json.Unmarshal(params, &p); err != nil {
+	if err := decodeParams(params, &p); err != nil {
 		return nil, &RPCError{Code: InvalidParams, Message: "Invalid params", Data: err.Error()}
 	}
 
@@ -497,9 +505,9 @@ type RenameParams struct {
 }
 
 // Rename renames/moves a file or directory
-func (h *Handler) Rename(params json.RawMessage) (interface{}, error) {
+func (h *Handler) Rename(params []byte) (interface{}, error) {
 	var p RenameParams
-	if err := json.Unmarshal(params, &p); err != nil {
+	if err := decodeParams(params, &p); err != nil {
 		return nil, &RPCError{Code: InvalidParams, Message: "Invalid params", Data: err.Error()}
 	}
 
@@ -520,9 +528,9 @@ type CopyParams struct {
 }
 
 // Copy copies a file
-func (h *Handler) Copy(params json.RawMessage) (interface{}, error) {
+func (h *Handler) Copy(params []byte) (interface{}, error) {
 	var p CopyParams
-	if err := json.Unmarshal(params, &p); err != nil {
+	if err := decodeParams(params, &p); err != nil {
 		return nil, &RPCError{Code: InvalidParams, Message: "Invalid params", Data: err.Error()}
 	}
 
@@ -564,9 +572,9 @@ type ExistsParams struct {
 }
 
 // Exists checks if a path exists
-func (h *Handler) Exists(params json.RawMessage) (interface{}, error) {
+func (h *Handler) Exists(params []byte) (interface{}, error) {
 	var p ExistsParams
-	if err := json.Unmarshal(params, &p); err != nil {
+	if err := decodeParams(params, &p); err != nil {
 		return nil, &RPCError{Code: InvalidParams, Message: "Invalid params", Data: err.Error()}
 	}
 
@@ -582,9 +590,9 @@ type RealpathParams struct {
 }
 
 // Realpath resolves a path to its canonical form
-func (h *Handler) Realpath(params json.RawMessage) (interface{}, error) {
+func (h *Handler) Realpath(params []byte) (interface{}, error) {
 	var p RealpathParams
-	if err := json.Unmarshal(params, &p); err != nil {
+	if err := decodeParams(params, &p); err != nil {
 		return nil, &RPCError{Code: InvalidParams, Message: "Invalid params", Data: err.Error()}
 	}
 
@@ -671,9 +679,9 @@ func BuildCacheEntries(info *InfoResult) []CacheEntry {
 }
 
 // Info returns combined file information: exists, stat, realpath, and content
-func (h *Handler) Info(params json.RawMessage) (interface{}, error) {
+func (h *Handler) Info(params []byte) (interface{}, error) {
 	var p InfoParams
-	if err := json.Unmarshal(params, &p); err != nil {
+	if err := decodeParams(params, &p); err != nil {
 		return nil, &RPCError{Code: InvalidParams, Message: "Invalid params", Data: err.Error()}
 	}
 
@@ -924,9 +932,9 @@ type BatchResult struct {
 // For files: returns full info including content
 // For directories: returns info with entries
 // Also fetches parent directories of all specified files
-func (h *Handler) Batch(params json.RawMessage) (interface{}, error) {
+func (h *Handler) Batch(params []byte) (interface{}, error) {
 	var p BatchParams
-	if err := json.Unmarshal(params, &p); err != nil {
+	if err := decodeParams(params, &p); err != nil {
 		return nil, &RPCError{Code: InvalidParams, Message: "Invalid params", Data: err.Error()}
 	}
 
@@ -999,9 +1007,9 @@ type ChmodParams struct {
 }
 
 // Chmod changes file permissions
-func (h *Handler) Chmod(params json.RawMessage) (interface{}, error) {
+func (h *Handler) Chmod(params []byte) (interface{}, error) {
 	var p ChmodParams
-	if err := json.Unmarshal(params, &p); err != nil {
+	if err := decodeParams(params, &p); err != nil {
 		return nil, &RPCError{Code: InvalidParams, Message: "Invalid params", Data: err.Error()}
 	}
 
@@ -1022,9 +1030,9 @@ type TouchParams struct {
 }
 
 // Touch updates file access and modification times
-func (h *Handler) Touch(params json.RawMessage) (interface{}, error) {
+func (h *Handler) Touch(params []byte) (interface{}, error) {
 	var p TouchParams
-	if err := json.Unmarshal(params, &p); err != nil {
+	if err := decodeParams(params, &p); err != nil {
 		return nil, &RPCError{Code: InvalidParams, Message: "Invalid params", Data: err.Error()}
 	}
 
@@ -1064,9 +1072,9 @@ type CopyDirResult struct {
 }
 
 // CopyDir recursively copies a directory
-func (h *Handler) CopyDir(params json.RawMessage) (interface{}, error) {
+func (h *Handler) CopyDir(params []byte) (interface{}, error) {
 	var p CopyDirParams
-	if err := json.Unmarshal(params, &p); err != nil {
+	if err := decodeParams(params, &p); err != nil {
 		return nil, &RPCError{Code: InvalidParams, Message: "Invalid params", Data: err.Error()}
 	}
 

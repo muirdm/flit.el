@@ -17,7 +17,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
-	"encoding/json"
+
 	"fmt"
 	"io"
 	"log/slog"
@@ -39,12 +39,12 @@ const (
 
 // Meta is the metadata for a frame. Encoded as msgpack on the wire.
 type Meta struct {
-	Type   int            `msgpack:"t"`
-	ID     int64          `msgpack:"id,omitempty"`
-	Method string         `msgpack:"method,omitempty"`
-	Params map[string]any `msgpack:"params,omitempty"`
-	Result any            `msgpack:"result,omitempty"`
-	Error  *ErrorInfo     `msgpack:"error,omitempty"`
+	Type   int                `msgpack:"t"`
+	ID     int64              `msgpack:"id,omitempty"`
+	Method string             `msgpack:"method,omitempty"`
+	Params msgpack.RawMessage `msgpack:"params,omitempty"` // raw msgpack, decoded by handler
+	Result any                `msgpack:"result,omitempty"`
+	Error  *ErrorInfo         `msgpack:"error,omitempty"`
 }
 
 // ErrorInfo is an error in a response frame.
@@ -144,7 +144,8 @@ func (fw *Writer) writeRaw(metaBuf, payload []byte) error {
 }
 
 // Handler processes an RPC request and returns a result.
-type Handler func(params json.RawMessage, payload []byte) (result any, resultPayload []byte, err error)
+// Params is raw msgpack bytes for the "params" field.
+type Handler func(params msgpack.RawMessage, payload []byte) (result any, resultPayload []byte, err error)
 
 // Server handles flitrpc requests.
 type Server struct {
@@ -157,7 +158,7 @@ type Server struct {
 
 	// RequestHandler is called for client->server requests not in the handler map.
 	// If nil, unknown methods return an error.
-	RequestHandler func(method string, params json.RawMessage, payload []byte) (any, []byte, error)
+	RequestHandler func(method string, params msgpack.RawMessage, payload []byte) (any, []byte, error)
 }
 
 // NewServer creates a server reading from r and writing to w.
@@ -176,25 +177,34 @@ func (s *Server) Handle(method string, h Handler) {
 	s.handlers[method] = h
 }
 
-// HandleFunc registers a simple handler that takes json params and returns a result.
-func (s *Server) HandleFunc(method string, fn func(params json.RawMessage) (any, error)) {
-	s.handlers[method] = func(params json.RawMessage, _ []byte) (any, []byte, error) {
+// HandleFunc registers a handler that takes raw msgpack params.
+func (s *Server) HandleFunc(method string, fn func(params msgpack.RawMessage) (any, error)) {
+	s.handlers[method] = func(params msgpack.RawMessage, _ []byte) (any, []byte, error) {
 		result, err := fn(params)
 		return result, nil, err
 	}
 }
 
-// HandleTyped registers a handler with typed params (unmarshaled from JSON).
+// HandleTyped registers a handler with typed params.
+// Params are unmarshaled from msgpack directly into the typed struct.
 func HandleTyped[P any](s *Server, method string, fn func(params P) (any, error)) {
-	s.HandleFunc(method, func(raw json.RawMessage) (any, error) {
+	s.HandleFunc(method, func(raw msgpack.RawMessage) (any, error) {
 		var p P
 		if len(raw) > 0 {
-			if err := json.Unmarshal(raw, &p); err != nil {
+			if err := UnmarshalParams(raw, &p); err != nil {
 				return nil, fmt.Errorf("invalid params: %w", err)
 			}
 		}
 		return fn(p)
 	})
+}
+
+// UnmarshalParams decodes raw msgpack params into a typed struct.
+// Uses json struct tags since Go structs have json:"..." tags.
+func UnmarshalParams(raw msgpack.RawMessage, v any) error {
+	dec := msgpack.NewDecoder(bytes.NewReader(raw))
+	dec.SetCustomStructTag("json")
+	return dec.Decode(v)
 }
 
 // Notify sends a notification to the client (no payload).
@@ -276,14 +286,7 @@ func (s *Server) handleRequest(frame *Frame) {
 		return
 	}
 
-	// Marshal params to JSON for handler consumption
-	paramsJSON, err := json.Marshal(frame.Meta.Params)
-	if err != nil {
-		s.sendError(id, -32600, fmt.Sprintf("invalid params: %v", err))
-		return
-	}
-
-	result, resultPayload, err := handler(paramsJSON, frame.Payload)
+	result, resultPayload, err := handler(frame.Meta.Params, frame.Payload)
 	if err != nil {
 		s.sendError(id, -32603, err.Error())
 		return
@@ -298,12 +301,7 @@ func (s *Server) handleRequest(frame *Frame) {
 }
 
 func (s *Server) handleWithFallback(frame *Frame) {
-	paramsJSON, err := json.Marshal(frame.Meta.Params)
-	if err != nil {
-		s.sendError(frame.Meta.ID, -32600, fmt.Sprintf("invalid params: %v", err))
-		return
-	}
-	result, resultPayload, err := s.RequestHandler(frame.Meta.Method, paramsJSON, frame.Payload)
+	result, resultPayload, err := s.RequestHandler(frame.Meta.Method, frame.Meta.Params, frame.Payload)
 	if err != nil {
 		s.sendError(frame.Meta.ID, -32603, err.Error())
 		return
