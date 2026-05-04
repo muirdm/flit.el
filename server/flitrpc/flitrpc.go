@@ -291,8 +291,9 @@ func (s *Server) Serve() error {
 			// Server-initiated request responses (e.g., heartbeat)
 			s.handleCallbackResponse(frame)
 		case TypeNotification:
-			// Client-to-server notification (e.g., exec/input)
-			go s.handleRequest(frame)
+			// Handle inline to preserve ordering.  All notification
+			// handlers must be non-blocking (use channels internally).
+			s.handleRequest(frame)
 		default:
 			s.logger.Warn("flitrpc: unknown frame type", "type", frame.Meta.Type)
 		}

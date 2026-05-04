@@ -991,20 +991,16 @@ hash lookup instead of flit--get-connection to avoid side effects."
   "Send STRING to flit process PROC via exec/input, or call ORIG-FN."
   (if-let* ((proc-id (flit--process-valid-for-rpc-p proc "send"))
             (host (process-get proc 'flit-host)))
-      (let ((idx (or (process-get proc 'flit-input-idx) 0))
-            ;; json-serialize requires multibyte strings. LSP messages containing
-            ;; non-ASCII may be unibyte if lsp-mode encoded them for the wire.
-            ;; Use utf-8-unix to decode properly. Note: 'utf-8 converts CR→LF,
-            ;; but 'utf-8-unix does not.
+      (let (;; Ensure multibyte string for msgpack encoding.
+            ;; LSP messages containing non-ASCII may be unibyte if
+            ;; lsp-mode encoded them for the wire.
             (data (if (multibyte-string-p string)
                       string
                     (decode-coding-string string 'utf-8-unix))))
-        ;; Increment idx for next call
-        (process-put proc 'flit-input-idx (1+ idx))
-        (flit--log-debug "process-send-string: proc-id=%s idx=%d len=%d"
-                         proc-id idx (length string))
+        (flit--log-debug "process-send-string: proc-id=%s len=%d"
+                         proc-id (length string))
         (flit--send-notify host "exec/input"
-                           `(:procId ,proc-id :data ,data :idx ,idx)))
+                           `(:procId ,proc-id :data ,data)))
     (funcall orig-fn proc string)))
 
 (advice-add 'process-send-string :around #'flit--process-send-string-advice)
