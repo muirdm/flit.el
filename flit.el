@@ -1465,8 +1465,12 @@ Defaults to `passive' when `flit--connection-tier' is unbound.
            (rpc (flitrpc-make-conn
                  proc host
                  :notification-fn
-                 (lambda (rpc-conn method params _ps _pe)
-                   (ignore rpc-conn)
+                 (lambda (rpc-conn method params ps pe)
+                   ;; Extract payload and attach as :payload on params
+                   (when (and ps pe (> pe ps))
+                     (let ((payload (with-current-buffer (flitrpc-conn-buffer rpc-conn)
+                                     (buffer-substring-no-properties ps pe))))
+                       (setq params (plist-put (copy-sequence params) :payload payload))))
                    (flit--handle-notification conn (intern method) params))
                  :request-fn
                  (lambda (rpc-conn method _params)
@@ -2408,7 +2412,8 @@ Caches entry info pushed by server async after fs/info on directories."
       (flit--cache-invalidate host path))
     ;; Find buffers visiting this file and mark them for revert
     (let* ((new-mtime (plist-get info :mtime))
-           (new-content-raw (plist-get info :content)))
+           (new-content-raw (or (plist-get params :payload)
+                                (plist-get info :content))))
       (dolist (buf (buffer-list))
         (with-current-buffer buf
           (when (and buffer-file-name
@@ -2480,13 +2485,11 @@ Caches entry info pushed by server async after fs/info on directories."
 
 (defun flit--handle-exec-output (params)
   "Handle exec/output notification with PARAMS.
-PARAMS contains :procId, :stream (stdout/stderr), and :data (base64-encoded)."
+PARAMS contains :procId, :stream, and :payload (raw bytes)."
   (let* ((proc-id (plist-get params :procId))
          (stream (plist-get params :stream))
-         ;; Data is base64-encoded by the server to safely transport binary data
-         (data (plist-get params :data))
+         (data (or (plist-get params :payload) (plist-get params :data)))
          (proc (gethash proc-id flit--processes)))
-    ;; Avoid logging huge elisp objects (workspace/client structs, filters).
     (flit--log-debug "exec-output: proc-id=%s stream=%s len=%d live=%s name=%s"
                      proc-id stream (length data)
                      (and proc (process-live-p proc))
@@ -2587,8 +2590,12 @@ Returns the result plist or signals an error."
                             method (flit--sanitize-params-for-log params)
                             (- (float-time) start-time)
                             (flit--format-rpc-result-extra method result))
-            ;; flitrpc wraps result in (:t 2 :id N :result RESULT) — extract it
-            (plist-get result :result))
+            ;; flitrpc wraps result in (:t 2 :id N :result RESULT :payload BYTES)
+            (let ((extracted (plist-get result :result))
+                  (payload (plist-get result :payload)))
+              (when payload
+                (setq extracted (plist-put (copy-sequence extracted) :content payload)))
+              extracted))
         (flitrpc-error
          (flit--log-error "RPC %s %S -> ERROR after %.3fs: %S"
                           method (flit--sanitize-params-for-log params)
@@ -5310,7 +5317,7 @@ A new client has connected to a remote tunnel listener."
 (defun flit--handle-tunnel-data (_conn params)
   "Handle a tunnel/data notification with PARAMS."
   (let* ((conn-id (plist-get params :connId))
-         (data (plist-get params :data))
+         (data (or (plist-get params :payload) (plist-get params :data)))
          (tunnel-id (plist-get params :tunnelId))
          (tunnel (gethash tunnel-id flit--tunnels)))
     (when tunnel

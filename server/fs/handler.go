@@ -224,17 +224,18 @@ type ReadParams struct {
 	Length int64  `json:"length,omitempty"`
 }
 
-// ReadResult represents the result of fs/read, combining content and stat info
+// ReadResult represents the result of fs/read.
+// File content is sent as the frame payload (not in metadata).
 type ReadResult struct {
-	Content []byte     `json:"content"` // Raw binary file content
-	Stat    InfoResult `json:"stat"`    // Full info including path/realpath/exists
+	Stat InfoResult `json:"stat"` // Full info including path/realpath/exists
 }
 
-// Read reads file contents and returns it along with fresh stat info
-func (h *Handler) Read(params []byte) (interface{}, error) {
+// Read reads file contents and returns it along with fresh stat info.
+// Returns (result, contentPayload, error) — content is sent as frame payload.
+func (h *Handler) Read(params []byte) (interface{}, []byte, error) {
 	var p ReadParams
 	if err := decodeParams(params, &p); err != nil {
-		return nil, &RPCError{Code: InvalidParams, Message: "Invalid params", Data: err.Error()}
+		return nil, nil, &RPCError{Code: InvalidParams, Message: "Invalid params", Data: err.Error()}
 	}
 
 	slog.Info("fs/read", "path", p.Path, "offset", p.Offset, "length", p.Length)
@@ -242,7 +243,7 @@ func (h *Handler) Read(params []byte) (interface{}, error) {
 	// Read the file content first
 	content, err := os.ReadFile(p.Path)
 	if err != nil {
-		return nil, fileError(err)
+		return nil, nil, fileError(err)
 	}
 
 	// Now that we have the content, stat the file to get the most up-to-date
@@ -250,12 +251,10 @@ func (h *Handler) Read(params []byte) (interface{}, error) {
 	// between a separate stat and read call.
 	info, err := os.Lstat(p.Path)
 	if err != nil {
-		return nil, fileError(err)
+		return nil, nil, fileError(err)
 	}
 
-	result := &ReadResult{
-		Content: content,
-	}
+	result := &ReadResult{}
 	result.Stat.Exists = true
 	result.Stat.Path = p.Path
 	populateStatFromFileInfo(&result.Stat, p.Path, info)
@@ -267,7 +266,7 @@ func (h *Handler) Read(params []byte) (interface{}, error) {
 		}
 	}
 
-	return result, nil
+	return result, content, nil
 }
 
 // WriteParams represents parameters for fs/write

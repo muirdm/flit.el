@@ -665,6 +665,8 @@ ERROR-FN is called with (error-plist)."
 (defun flitrpc-request-sync (conn method params &optional timeout)
   "Send request to CONN and wait for response.
 TIMEOUT defaults to 5 seconds.  Returns the result meta plist.
+If the response has a payload, it is extracted from the process buffer
+and attached as :payload on the result.
 Nested calls work: each has its own done/result variables."
   (let ((done nil)
         (result nil)
@@ -672,7 +674,14 @@ Nested calls work: each has its own done/result variables."
         (deadline (+ (float-time) (or timeout 5)))
         (proc (flitrpc-conn-process conn)))
     (flitrpc-request conn method params
-                     (lambda (meta _ps _pe) (setq result meta done t))
+                     (lambda (meta ps pe)
+                       ;; Extract payload while the buffer region is valid
+                       (when (and ps pe (> pe ps))
+                         (setq meta (plist-put (copy-sequence meta)
+                                              :payload
+                                              (with-current-buffer (flitrpc-conn-buffer conn)
+                                                (buffer-substring-no-properties ps pe)))))
+                       (setq result meta done t))
                      (lambda (e) (setq err e done t)))
     (while (not done)
       (when (> (float-time) deadline)
