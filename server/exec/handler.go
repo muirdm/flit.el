@@ -50,7 +50,7 @@ type Process struct {
 	// Async input: inputs are queued to inputCh and written by a dedicated
 	// goroutine, so a blocked stdin write doesn't block the RPC server.
 	// Ordering is guaranteed by flitrpc's inline notification dispatch.
-	inputCh        chan string
+	inputCh        chan []byte
 	inputClosed    bool // protected by mu, prevents send to closed channel
 	inputCloseOnce sync.Once
 }
@@ -185,7 +185,7 @@ func (m *Manager) Start(params StartParams) (*StartResult, error) {
 				cancel()
 				ptmx.Close() // unblock any blocked write/read on the PTY
 			},
-			inputCh: make(chan string, 1024),
+			inputCh: make(chan []byte, 1024),
 		}
 		go m.inputWriter(proc)
 
@@ -236,7 +236,7 @@ func (m *Manager) Start(params StartParams) (*StartResult, error) {
 				cancel()
 				stdin.Close() // unblock any blocked write on stdin
 			},
-			inputCh: make(chan string, 1024),
+			inputCh: make(chan []byte, 1024),
 		}
 		go m.inputWriter(proc)
 
@@ -339,24 +339,22 @@ func (m *Manager) waitForExitWithWg(procID string, cmd *exec.Cmd, wg *sync.WaitG
 	}
 }
 
-// InputParams contains parameters for sending input to a process
+// InputParams contains parameters for sending input to a process.
+// The actual data is in the frame payload (raw bytes), not in params.
 type InputParams struct {
 	ProcID string `json:"procId"`
-	Data   string `json:"data"`
 }
 
 // Input sends data to a process's stdin (or PTY).
-// Data is queued to a per-process channel and written by a dedicated goroutine,
-// so a blocked stdin write never blocks the RPC server.
-// Ordering is guaranteed by the flitrpc Serve loop which handles notifications
-// inline (not in goroutines).
-func (m *Manager) Input(params InputParams) error {
+// Non-blocking: data is queued to a per-process channel.
+// Ordering is guaranteed by flitrpc's inline notification dispatch.
+func (m *Manager) Input(procID string, data []byte) error {
 	m.mu.RLock()
-	proc, exists := m.processes[params.ProcID]
+	proc, exists := m.processes[procID]
 	m.mu.RUnlock()
 
 	if !exists {
-		return fmt.Errorf("process not found: %s", params.ProcID)
+		return fmt.Errorf("process not found: %s", procID)
 	}
 
 	proc.mu.Lock()
@@ -367,10 +365,10 @@ func (m *Manager) Input(params InputParams) error {
 	}
 
 	select {
-	case proc.inputCh <- params.Data:
+	case proc.inputCh <- data:
 		return nil
 	default:
-		return fmt.Errorf("input buffer full for process %s", params.ProcID)
+		return fmt.Errorf("input buffer full for process %s", procID)
 	}
 }
 
@@ -392,13 +390,13 @@ func (m *Manager) inputWriter(proc *Process) {
 
 // writeInput writes data to the process's stdin or PTY.
 // Caller must hold proc.mu.
-func (proc *Process) writeInput(data string) error {
+func (proc *Process) writeInput(data []byte) error {
 	if proc.ptyFile != nil {
-		_, err := proc.ptyFile.Write([]byte(data))
+		_, err := proc.ptyFile.Write(data)
 		return err
 	}
 	if proc.stdin != nil {
-		_, err := proc.stdin.Write([]byte(data))
+		_, err := proc.stdin.Write(data)
 		return err
 	}
 	return fmt.Errorf("process has no input stream")

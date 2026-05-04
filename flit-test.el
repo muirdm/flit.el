@@ -1887,8 +1887,8 @@ buffer in an unmodified state even though content differed from disk."
                          (raw-content (encode-coding-string content 'utf-8-unix))
                          (result (flit--send-request host "fs/write"
                                    `(:path ,path
-                                     :content (:bin . ,raw-content)
-                                     :expectedMtime ,original-mtime))))
+                                     :expectedMtime ,original-mtime)
+                                   nil raw-content)))
                     ;; Should get mismatch response
                     (should (eq (plist-get result :mismatch) t))
                     ;; Current file info should be returned
@@ -1915,8 +1915,8 @@ buffer in an unmodified state even though content differed from disk."
                (raw-content (encode-coding-string content 'utf-8-unix))
                (result (flit--send-request host "fs/write"
                          `(:path ,path
-                           :content (:bin . ,raw-content)
-                           :expectNotExist t))))
+                           :expectNotExist t)
+                         nil raw-content)))
           ;; Should get mismatch response
           (should (eq (plist-get result :mismatch) t))
           ;; Current file info should be returned
@@ -1943,8 +1943,8 @@ buffer in an unmodified state even though content differed from disk."
                          (raw-content (encode-coding-string content 'utf-8-unix))
                          (result (flit--send-request host "fs/write"
                                    `(:path ,path
-                                     :content (:bin . ,raw-content)
-                                     :expectedMtime ,current-mtime))))
+                                     :expectedMtime ,current-mtime)
+                                   nil raw-content)))
                     ;; Should NOT get mismatch
                     (should-not (plist-get result :mismatch))
                     ;; Should have file info
@@ -1979,15 +1979,16 @@ buffer in an unmodified state even though content differed from disk."
                          (raw-content (encode-coding-string content 'utf-8-unix))
                          (result (flit--send-request host "fs/write"
                                    `(:path ,path
-                                     :content (:bin . ,raw-content)
-                                     :expectedMtime ,original-mtime))))
+                                     :expectedMtime ,original-mtime)
+                                   nil raw-content)))
                     (should (eq (plist-get result :mismatch) t)))
 
                   ;; Force write should succeed
                   (let* ((content "my new content")
                          (raw-content (encode-coding-string content 'utf-8-unix))
                          (result (flit--send-request host "fs/write"
-                                   `(:path ,path :content (:bin . ,raw-content) :force t))))
+                                   `(:path ,path :force t)
+                                   nil raw-content)))
                     ;; Should succeed without mismatch
                     (should-not (plist-get result :mismatch))
                     ;; File should have our content now
@@ -2006,8 +2007,8 @@ buffer in an unmodified state even though content differed from disk."
                (raw-content (encode-coding-string content 'utf-8-unix))
                (result (flit--send-request host "fs/write"
                          `(:path ,path
-                           :content (:bin . ,raw-content)
-                           :expectNotExist t))))
+                           :expectNotExist t)
+                         nil raw-content)))
           ;; Should NOT get mismatch
           (should-not (plist-get result :mismatch))
           ;; File should exist now

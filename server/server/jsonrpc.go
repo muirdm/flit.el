@@ -929,13 +929,15 @@ func (s *Server) registerHandlers(rpc *flitrpc.Server, sess *Session) {
 	simple("fs/copy-dir", s.fsHandler.CopyDir)
 
 	// fs/write needs special handling for mtime suppression
-	rpc.HandleFunc("fs/write", func(params msgpack.RawMessage) (any, error) {
+	// Content comes from frame payload, not params.
+	rpc.Handle("fs/write", func(raw msgpack.RawMessage, payload []byte) (any, []byte, error) {
 		s.touch()
 		startTime := time.Now()
 		var p fs.WriteParams
-		if err := flitrpc.UnmarshalParams(params, &p); err != nil {
-			return nil, fmt.Errorf("invalid params: %w", err)
+		if err := flitrpc.UnmarshalParams(raw, &p); err != nil {
+			return nil, nil, fmt.Errorf("invalid params: %w", err)
 		}
+		p.Content = payload
 		sess.UpdateFileState(p.Path, time.Now().Unix(), int64(len(p.Content)))
 		result, err := s.fsHandler.Write(&p)
 		if err == nil {
@@ -944,7 +946,7 @@ func (s *Server) registerHandlers(rpc *flitrpc.Server, sess *Session) {
 			}
 		}
 		sess.logger.Info("fs/write done", "path", p.Path, "elapsed", time.Since(startTime))
-		return result, err
+		return result, nil, err
 	})
 
 	// fs/info with auto-watch and async child fetch
@@ -1076,15 +1078,19 @@ func (s *Server) registerHandlers(rpc *flitrpc.Server, sess *Session) {
 		}
 		return sess.procManager.Start(params)
 	})
-	flitrpc.HandleTyped(rpc, "exec/input", func(params exec.InputParams) (any, error) {
+	rpc.Handle("exec/input", func(raw msgpack.RawMessage, payload []byte) (any, []byte, error) {
 		s.touch()
 		if sess.procManager == nil {
-			return nil, fmt.Errorf("process manager not initialized")
+			return nil, nil, fmt.Errorf("process manager not initialized")
 		}
-		if err := sess.procManager.Input(params); err != nil {
-			return nil, err
+		var params exec.InputParams
+		if err := flitrpc.UnmarshalParams(raw, &params); err != nil {
+			return nil, nil, err
 		}
-		return map[string]bool{"ok": true}, nil
+		if err := sess.procManager.Input(params.ProcID, payload); err != nil {
+			return nil, nil, err
+		}
+		return map[string]bool{"ok": true}, nil, nil
 	})
 	flitrpc.HandleTyped(rpc, "exec/signal", func(params exec.SignalParams) (any, error) {
 		s.touch()
@@ -1218,15 +1224,20 @@ func (s *Server) registerHandlers(rpc *flitrpc.Server, sess *Session) {
 		}
 		return map[string]bool{"ok": true}, nil
 	})
-	flitrpc.HandleTyped(rpc, "tunnel/data", func(params tunnel.DataParams) (any, error) {
+	rpc.Handle("tunnel/data", func(raw msgpack.RawMessage, payload []byte) (any, []byte, error) {
 		s.touch()
 		if sess.tunnelManager == nil {
-			return nil, fmt.Errorf("tunnel manager not initialized")
+			return nil, nil, fmt.Errorf("tunnel manager not initialized")
 		}
+		var params tunnel.DataParams
+		if err := flitrpc.UnmarshalParams(raw, &params); err != nil {
+			return nil, nil, err
+		}
+		params.Data = payload
 		if err := sess.tunnelManager.SendData(params); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		return map[string]bool{"ok": true}, nil
+		return map[string]bool{"ok": true}, nil, nil
 	})
 	flitrpc.HandleTyped(rpc, "tunnel/disconnect", func(params tunnel.DisconnectParams) (any, error) {
 		s.touch()
