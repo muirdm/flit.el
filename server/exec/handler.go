@@ -25,7 +25,7 @@ import (
 	"os/exec"
 	"sync"
 	"syscall"
-	"time"
+
 
 	"github.com/creack/pty"
 )
@@ -49,22 +49,11 @@ type Process struct {
 
 	// Async input: inputs are queued to inputCh and written by a dedicated
 	// goroutine, so a blocked stdin write doesn't block the RPC server.
+	// Ordering is guaranteed by flitrpc's inline notification dispatch.
 	inputCh        chan string
 	inputClosed    bool // protected by mu, prevents send to closed channel
 	inputCloseOnce sync.Once
-
-	// Input ordering: buffer out-of-order inputs and write in sequence
-	inputExpectedIdx int64            // next expected input index
-	inputBuffer      map[int64]string // buffered out-of-order inputs
-	inputBufferSize  int              // total bytes buffered
 }
-
-const (
-	// Maximum bytes to buffer for out-of-order inputs per process
-	maxInputBufferSize = 10 * 1024 * 1024 // 10 MB
-	// Maximum number of out-of-order inputs to buffer
-	maxInputBufferCount = 1000
-)
 
 // Manager manages running async processes
 type Manager struct {
@@ -354,13 +343,13 @@ func (m *Manager) waitForExitWithWg(procID string, cmd *exec.Cmd, wg *sync.WaitG
 type InputParams struct {
 	ProcID string `json:"procId"`
 	Data   string `json:"data"`
-	Idx    int64  `json:"idx"` // Sequence number for ordering (0-based)
 }
 
-// Input sends data to a process's stdin (or PTY)
-// Inputs are buffered and written in order based on Idx.
+// Input sends data to a process's stdin (or PTY).
 // Data is queued to a per-process channel and written by a dedicated goroutine,
 // so a blocked stdin write never blocks the RPC server.
+// Ordering is guaranteed by the flitrpc Serve loop which handles notifications
+// inline (not in goroutines).
 func (m *Manager) Input(params InputParams) error {
 	m.mu.RLock()
 	proc, exists := m.processes[params.ProcID]
@@ -374,72 +363,14 @@ func (m *Manager) Input(params InputParams) error {
 	defer proc.mu.Unlock()
 
 	if proc.inputClosed {
-		return nil // process exiting, discard silently
+		return nil
 	}
 
-	// Initialize buffer on first use
-	if proc.inputBuffer == nil {
-		proc.inputBuffer = make(map[int64]string)
-	}
-
-	// Check if this is the expected input
-	if params.Idx == proc.inputExpectedIdx {
-		// Queue this input and any buffered sequential ones
-		m.queueInput(proc, params.Data)
-		proc.inputExpectedIdx++
-
-		// Drain any buffered inputs that are now in sequence
-		for {
-			if data, ok := proc.inputBuffer[proc.inputExpectedIdx]; ok {
-				m.queueInput(proc, data)
-				proc.inputBufferSize -= len(data)
-				delete(proc.inputBuffer, proc.inputExpectedIdx)
-				proc.inputExpectedIdx++
-			} else {
-				break
-			}
-		}
-	} else if params.Idx > proc.inputExpectedIdx {
-		// Future input - buffer it if we have room
-		if len(proc.inputBuffer) >= maxInputBufferCount {
-			return fmt.Errorf("input buffer count exceeded (%d pending)", len(proc.inputBuffer))
-		}
-		if proc.inputBufferSize+len(params.Data) > maxInputBufferSize {
-			return fmt.Errorf("input buffer size exceeded (%d bytes pending)", proc.inputBufferSize)
-		}
-		proc.inputBuffer[params.Idx] = params.Data
-		proc.inputBufferSize += len(params.Data)
-		slog.Debug("exec/input: buffered out-of-order input",
-			"procId", params.ProcID, "idx", params.Idx,
-			"expected", proc.inputExpectedIdx, "buffered", len(proc.inputBuffer))
-	}
-	// else: params.Idx < proc.inputExpectedIdx - duplicate, ignore silently
-
-	return nil
-}
-
-// queueInput sends data to the process's input channel for async writing.
-// If the channel is full (writer goroutine blocked on stdin), waits up to 5s
-// then kills the process — a corrupted input stream can't be recovered.
-// Caller must hold proc.mu.
-func (m *Manager) queueInput(proc *Process, data string) {
 	select {
-	case proc.inputCh <- data:
-		return
+	case proc.inputCh <- params.Data:
+		return nil
 	default:
-	}
-
-	// Channel full — give the process time to drain before killing it.
-	timer := time.NewTimer(5 * time.Second)
-	defer timer.Stop()
-	select {
-	case proc.inputCh <- data:
-		return
-	case <-timer.C:
-		m.logger.Warn("exec/input: stdin write blocked for 5s, killing process",
-			"procId", proc.ID, "cmd", proc.cmdName)
-		proc.inputClosed = true // caller holds proc.mu
-		proc.cancel()
+		return fmt.Errorf("input buffer full for process %s", params.ProcID)
 	}
 }
 

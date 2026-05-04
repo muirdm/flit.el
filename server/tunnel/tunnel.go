@@ -53,6 +53,7 @@ type Connection struct {
 	ID       string
 	TunnelID string
 	conn     net.Conn
+	writeCh  chan []byte // buffered write channel for non-blocking sends
 	manager  *Manager
 	closed   atomic.Bool
 }
@@ -161,6 +162,7 @@ func (m *Manager) Connect(params ConnectParams) error {
 		ID:       params.ConnID,
 		TunnelID: params.TunnelID,
 		conn:     conn,
+		writeCh:  make(chan []byte, 4096),
 		manager:  m,
 	}
 
@@ -171,6 +173,7 @@ func (m *Manager) Connect(params ConnectParams) error {
 	m.logger.Info("Tunnel connected", "connId", params.ConnID, "tunnelId", params.TunnelID, "port", params.Port)
 
 	go c.readLoop()
+	go c.writeLoop()
 
 	return nil
 }
@@ -191,8 +194,25 @@ func (m *Manager) SendData(params DataParams) error {
 		return fmt.Errorf("connection %s not found", params.ConnID)
 	}
 
-	_, err := conn.conn.Write(params.Data)
-	return err
+	select {
+	case conn.writeCh <- params.Data:
+		return nil
+	default:
+		return fmt.Errorf("tunnel write buffer full for connection %s", params.ConnID)
+	}
+}
+
+// writeLoop drains the write channel and writes to the TCP connection.
+func (c *Connection) writeLoop() {
+	for data := range c.writeCh {
+		if _, err := c.conn.Write(data); err != nil {
+			if !c.closed.Load() {
+				c.manager.logger.Debug("Tunnel write error", "connId", c.ID, "error", err)
+			}
+			c.cleanup()
+			return
+		}
+	}
 }
 
 // DisconnectParams contains parameters for disconnecting a connection.
@@ -259,6 +279,7 @@ func (l *Listener) acceptLoop() {
 			ID:       connID,
 			TunnelID: l.ID,
 			conn:     conn,
+			writeCh:  make(chan []byte, 4096),
 			manager:  l.manager,
 		}
 
@@ -275,6 +296,7 @@ func (l *Listener) acceptLoop() {
 		l.manager.logger.Info("Tunnel connection accepted", "tunnelId", l.ID, "connId", connID)
 
 		go c.readLoop()
+		go c.writeLoop()
 	}
 }
 
@@ -316,6 +338,7 @@ func (c *Connection) cleanup() {
 		return
 	}
 	c.conn.Close()
+	close(c.writeCh)
 
 	c.manager.mu.Lock()
 	delete(c.manager.conns, c.ID)
