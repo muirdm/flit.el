@@ -468,12 +468,11 @@ PAYLOAD is an optional unibyte string of raw bytes."
   host            ; remote host name
   pending         ; hash table: id -> (success-fn . error-fn)
   next-id         ; next request ID counter
-  notification-fn ; function called for notifications: (fn method params payload-start payload-end)
+  notification-fn ; function called for notifications: (fn conn method params payload-data)
   request-fn      ; function called for server->client requests: (fn method params) -> result
   chunks          ; hash table: id -> (meta . payload-parts) for chunked reassembly
   on-shutdown     ; function called when connection closes
-  sync-done       ; set to t when a sync request completes, to interrupt parsing
-  parsing)        ; t while flitrpc--parse-frames is running (prevents re-entrancy)
+  sync-done)      ; set to t when a sync request completes, to interrupt parsing
 
 (defun flitrpc-make-conn (process host &rest args)
   "Create a flitrpc connection over PROCESS for HOST.
@@ -505,16 +504,8 @@ ARGS are keyword args: :notification-fn, :request-fn, :on-shutdown."
         (with-current-buffer buf
           (goto-char (point-max))
           (insert data))
-        ;; Only parse if not already parsing.  Re-entrant filter calls
-        ;; happen when a dispatch callback triggers accept-process-output
-        ;; (e.g., sync RPC from a notification handler).  In that case,
-        ;; just buffer the data — the outer parse loop will process it.
-        (unless (flitrpc-conn-parsing conn)
-          (setf (flitrpc-conn-parsing conn) t)
-          (unwind-protect
-              (with-current-buffer buf
-                (flitrpc--parse-frames conn))
-            (setf (flitrpc-conn-parsing conn) nil)))))))
+        (with-current-buffer buf
+          (flitrpc--parse-frames conn))))))
 
 (defun flitrpc--make-sentinel (conn)
   "Return a process sentinel function for CONN."
@@ -530,48 +521,54 @@ ARGS are keyword args: :notification-fn, :request-fn, :on-shutdown."
       (clrhash (flitrpc-conn-pending conn)))))
 
 (defun flitrpc--parse-frames (conn)
-  "Parse all complete frames from CONN's buffer."
+  "Parse all complete frames from CONN's buffer.
+Safe for re-entrant calls: each frame is deleted from the buffer
+before dispatch, so nested parse calls (from sync RPCs triggered
+by notification callbacks) see a clean buffer."
   (let ((buf (flitrpc-conn-buffer conn)))
     (with-current-buffer buf
-      (goto-char (point-min))
       (catch 'flitrpc--incomplete
-        (while (>= (- (point-max) (point)) flitrpc--header-size)
+        (while t
+          (goto-char (point-min))
+          (when (< (- (point-max) (point)) flitrpc--header-size)
+            (throw 'flitrpc--incomplete nil))
           (let* ((hdr-start (point))
                  (meta-len (flitrpc--read-u32-at buf hdr-start))
                  (payload-len (flitrpc--read-u32-at buf (+ hdr-start 4)))
                  (frame-len (+ flitrpc--header-size meta-len payload-len)))
             (when (< (- (point-max) hdr-start) frame-len)
-              (goto-char hdr-start)
               (throw 'flitrpc--incomplete nil))
             (let* ((meta-start (+ hdr-start flitrpc--header-size))
                    (meta-pair (flitrpc--read-msgpack buf meta-start))
                    (meta (car meta-pair))
                    (payload-start (+ meta-start meta-len))
-                   (payload-end (+ payload-start payload-len)))
-              (goto-char payload-end)
-              (flitrpc--dispatch-frame conn meta payload-start payload-end)
+                   (payload-end (+ payload-start payload-len))
+                   ;; Extract payload before deleting the frame
+                   (payload-data (when (> payload-len 0)
+                                   (buffer-substring-no-properties
+                                    payload-start payload-end))))
+              ;; Delete frame from buffer BEFORE dispatch so re-entrant
+              ;; calls (from sync RPCs in notification callbacks) don't
+              ;; re-process this frame.
+              (delete-region (point-min) payload-end)
+              (flitrpc--dispatch-frame conn meta payload-data)
               ;; If a sync request just completed, stop processing.
-              ;; Remaining frames stay in the buffer and are processed
-              ;; on the next accept-process-output, after the sync
-              ;; caller returns (giving make-process callers time to
-              ;; install their real process filter).
               (when (flitrpc-conn-sync-done conn)
                 (setf (flitrpc-conn-sync-done conn) nil)
-                (throw 'flitrpc--incomplete nil))))))
-      (delete-region (point-min) (point)))))
+                (throw 'flitrpc--incomplete nil)))))))))
 
-(defun flitrpc--dispatch-frame (conn meta payload-start payload-end)
-  "Dispatch a parsed frame from CONN."
+(defun flitrpc--dispatch-frame (conn meta payload-data)
+  "Dispatch a parsed frame from CONN.
+PAYLOAD-DATA is the extracted payload string, or nil."
   (let ((msg-type (plist-get meta :t))
         (id (plist-get meta :id)))
     (pcase msg-type
       ;; Response
       ((pred (= flitrpc--type-response))
-       (message "flitrpc: received response id=%d" id)
        (let ((err (plist-get meta :error)))
          (if err
              (flitrpc--complete-request conn id nil err)
-           (flitrpc--complete-request conn id meta nil payload-start payload-end))))
+           (flitrpc--complete-request conn id meta nil payload-data))))
       ;; Notification — use condition-case-unless-debug so errors in one
       ;; notification don't abort processing of subsequent frames, but
       ;; the debugger still triggers when debug-on-error is set.
@@ -580,7 +577,7 @@ ARGS are keyword args: :notification-fn, :request-fn, :on-shutdown."
          (let ((method (plist-get meta :method))
                (params (plist-get meta :params)))
            (condition-case-unless-debug err
-               (funcall fn conn method params payload-start payload-end)
+               (funcall fn conn method params payload-data)
              (error
               (message "flitrpc: error in notification %s: %s"
                        method (error-message-string err)))))))
@@ -595,34 +592,29 @@ ARGS are keyword args: :notification-fn, :request-fn, :on-shutdown."
                                (list :result result))))
       ;; Chunk continue
       ((pred (= flitrpc--type-chunk-continue))
-       (flitrpc--accumulate-chunk conn id payload-start payload-end))
+       (flitrpc--accumulate-chunk-data conn id payload-data))
       ;; Chunk end
       ((pred (= flitrpc--type-chunk-end))
        (flitrpc--finish-chunks conn id)))))
 
-(defun flitrpc--complete-request (conn id meta err &optional payload-start payload-end)
+(defun flitrpc--complete-request (conn id meta err &optional payload-data)
   "Complete pending request ID on CONN with META/ERR."
-  (let ((entry (gethash id (flitrpc-conn-pending conn))))
-    (unless entry
-      (message "flitrpc: response for unknown id %d (pending: %S)" id
-               (hash-table-keys (flitrpc-conn-pending conn))))
-    (when entry
-      (remhash id (flitrpc-conn-pending conn))
-      (if err
-          (funcall (cdr entry) err)
-        (funcall (car entry) meta payload-start payload-end)))))
+  (when-let ((entry (gethash id (flitrpc-conn-pending conn))))
+    (remhash id (flitrpc-conn-pending conn))
+    (if err
+        (funcall (cdr entry) err)
+      (funcall (car entry) meta payload-data))))
 
 ;; Chunked message reassembly
 
-(defun flitrpc--accumulate-chunk (conn id payload-start payload-end)
+(defun flitrpc--accumulate-chunk-data (conn id payload-data)
   "Accumulate a chunk for message ID."
   (let* ((chunks (flitrpc-conn-chunks conn))
          (entry (gethash id chunks)))
     (unless entry
       (error "flitrpc: chunk-continue for unknown id %d" id))
-    ;; Append payload bytes to accumulation buffer
-    (let ((chunk-data (buffer-substring-no-properties payload-start payload-end)))
-      (setcdr entry (cons chunk-data (cdr entry))))))
+    (when payload-data
+      (setcdr entry (cons payload-data (cdr entry))))))
 
 (defun flitrpc--finish-chunks (conn id)
   "Reassemble and dispatch completed chunked message for ID."
@@ -632,44 +624,19 @@ ARGS are keyword args: :notification-fn, :request-fn, :on-shutdown."
       (remhash id chunks)
       (let* ((meta (car entry))
              (parts (nreverse (cdr entry)))
-             (full-payload (apply #'concat parts))
-             ;; Insert reassembled payload into buffer so callbacks
-             ;; can use insert-buffer-substring
-             (buf (flitrpc-conn-buffer conn)))
-        (with-current-buffer buf
-          (save-excursion
-            (goto-char (point-max))
-            (let ((start (point)))
-              (insert full-payload)
-              (let ((end (point)))
-                (flitrpc--dispatch-reassembled conn meta start end)))))))))
-
-(defun flitrpc--dispatch-reassembled (conn meta payload-start payload-end)
-  "Dispatch a reassembled chunked message."
-  (let ((msg-type (plist-get meta :t))
-        (id (plist-get meta :id)))
-    (pcase msg-type
-      ((pred (= flitrpc--type-response))
-       (let ((err (plist-get meta :error)))
-         (if err
-             (flitrpc--complete-request conn id nil err)
-           (flitrpc--complete-request conn id meta nil payload-start payload-end))))
-      ((pred (= flitrpc--type-notification))
-       (when-let ((fn (flitrpc-conn-notification-fn conn)))
-         (funcall fn conn (plist-get meta :method) (plist-get meta :params)
-                  payload-start payload-end))))))
+             (full-payload (apply #'concat parts)))
+        (flitrpc--dispatch-frame conn meta full-payload)))))
 
 
 ;;; Public API
 
 (defun flitrpc-request (conn method params success-fn &optional error-fn)
   "Send async request to CONN.  Return msg-id.
-SUCCESS-FN is called with (meta payload-start payload-end).
+SUCCESS-FN is called with (meta payload-data).
 ERROR-FN is called with (error-plist)."
   (let ((id (cl-incf (flitrpc-conn-next-id conn))))
     (puthash id (cons success-fn (or error-fn #'ignore))
              (flitrpc-conn-pending conn))
-    (message "flitrpc: sending request id=%d method=%s" id method)
     (flitrpc--write-frame conn
                           flitrpc--type-request id
                           (list :method method :params params))
@@ -705,13 +672,10 @@ Nested calls work: each has its own done/result variables."
         (deadline (+ (float-time) (or timeout 5)))
         (proc (flitrpc-conn-process conn)))
     (flitrpc-request conn method params
-                     (lambda (meta ps pe)
-                       ;; Extract payload while the buffer region is valid
-                       (when (and ps pe (> pe ps))
+                     (lambda (meta payload-data)
+                       (when payload-data
                          (setq meta (plist-put (copy-sequence meta)
-                                              :payload
-                                              (with-current-buffer (flitrpc-conn-buffer conn)
-                                                (buffer-substring-no-properties ps pe)))))
+                                              :payload payload-data)))
                        (setf (flitrpc-conn-sync-done conn) t)
                        (setq result meta done t))
                      (lambda (e)
@@ -726,18 +690,17 @@ Nested calls work: each has its own done/result variables."
     result))
 
 (defun flitrpc-request-sync-with-payload (conn method params &optional timeout)
-  "Like `flitrpc-request-sync' but also return payload region.
-Returns (META PAYLOAD-START PAYLOAD-END) list."
+  "Like `flitrpc-request-sync' but also return payload data.
+Returns (META PAYLOAD-DATA) list."
   (let ((done nil)
         (result-meta nil)
-        (result-ps nil)
-        (result-pe nil)
+        (result-payload nil)
         (err nil)
         (deadline (+ (float-time) (or timeout 5)))
         (proc (flitrpc-conn-process conn)))
     (flitrpc-request conn method params
-                     (lambda (meta ps pe)
-                       (setq result-meta meta result-ps ps result-pe pe done t))
+                     (lambda (meta payload-data)
+                       (setq result-meta meta result-payload payload-data done t))
                      (lambda (e) (setq err e done t)))
     (while (not done)
       (when (> (float-time) deadline)
@@ -745,7 +708,7 @@ Returns (META PAYLOAD-START PAYLOAD-END) list."
       (accept-process-output proc 0.5))
     (when err
       (signal 'flitrpc-error (list err)))
-    (list result-meta result-ps result-pe)))
+    (list result-meta result-payload)))
 
 (define-error 'flitrpc-error "flitrpc error")
 
