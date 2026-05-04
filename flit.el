@@ -1606,13 +1606,29 @@ the final connection with `flit--make-connection'."
 (defun flit--find-local-binary ()
   "Find the local flit binary.
 Search order: `exec-path', then source-dir/flit.
-If not found and interactive, offer to compile."
-  (or (executable-find "flit")
-      (let ((in-source (expand-file-name "flit" flit--source-directory)))
-        (and (file-executable-p in-source) in-source))
-      (when (y-or-n-p "Local flit binary not found. Compile now?")
-        (flit--compile-local))
-      (error "flit binary not found")))
+If not found and interactive, offer to compile.
+Checks proto version matches — prompts to recompile if stale."
+  (let ((binary (or (executable-find "flit")
+                    (let ((in-source (expand-file-name "flit" flit--source-directory)))
+                      (and (file-executable-p in-source) in-source))
+                    (when (y-or-n-p "Local flit binary not found. Compile now?")
+                      (flit--compile-local))
+                    (error "flit binary not found"))))
+    (flit--check-local-binary-version binary)
+    binary))
+
+(defun flit--check-local-binary-version (binary)
+  "Check that BINARY has the expected proto version.
+Signals an error with a recompile suggestion if mismatched."
+  (let ((output (string-trim
+                 (with-output-to-string
+                   (with-current-buffer standard-output
+                     (call-process binary nil t nil "version"))))))
+    (unless (equal output (number-to-string flit--proto-version))
+      (if (y-or-n-p (format "Local flit binary (proto %s) doesn't match client (proto %d). Recompile?"
+                            output flit--proto-version))
+          (flit--compile-local)
+        (error "Flit binary version mismatch")))))
 
 (defun flit--compile-local ()
   "Compile flit for the local platform.  Returns binary path."
