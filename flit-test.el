@@ -992,10 +992,11 @@ Must be called with the target buffer current."
       (with-timeout (5 (error "Batch prefetch timed out"))
         (while (not done)
           (accept-process-output nil 0.1)))
-      ;; Check result has cache entries
       (should result)
-      (should (plist-get result :cache))
-      ;; Check files were cached with content (already decoded on cache)
+      ;; Cache entries arrive as async notifications — wait for them
+      (flit-test--wait-for
+       (lambda () (flit--cache-get flit-test--host (concat flit-test--temp-dir "/file1.txt"))))
+      ;; Check files were cached with content
       (let ((file1-info (flit--cache-get flit-test--host (concat flit-test--temp-dir "/file1.txt"))))
         (should file1-info)
         (should (eq (plist-get file1-info :exists) t))

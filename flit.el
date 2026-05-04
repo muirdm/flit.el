@@ -2385,11 +2385,22 @@ Caches ancestor directory info pushed by server during fs/open."
 
 (defun flit--handle-entry-info (conn params)
   "Handle entry info notification from CONN with PARAMS.
-Caches entry info pushed by server async after fs/info on directories."
+Caches entry info pushed by server async after fs/info on directories
+and fs/batch for file prefetching.  Payload content (if any) is
+attached to the first cache entry."
   (let* ((host (flit-connection-host conn))
          (path (plist-get params :path))
          (cache (plist-get params :cache))
+         (payload (plist-get params :payload))
          (count (length cache)))
+    ;; Attach payload content to the matching cache entry
+    (when (and payload cache)
+      (let ((entry (seq-find (lambda (e) (equal (plist-get e :path) path))
+                             (append cache nil))))
+        (when entry
+          (let ((info (plist-get entry :info)))
+            (when info
+              (plist-put info :content payload))))))
     (flit--log-debug "Entry info: caching %d entries for %s:%s" count host path)
     (flit--cache-from-response host params)))
 
@@ -4260,13 +4271,10 @@ Async connection is established first; if auth is needed, fails immediately."
          (condition-case err
              (flit--send-request-async
               host "fs/batch" `(:paths ,(vconcat paths))
-              (lambda (result)
-                (flit--cache-from-response host result)
-                (let ((errors (plist-get result :errors)))
-                  (when errors
-                    (cl-loop for (path msg) on errors by #'cddr
-                             do (flit--log-debug "Batch error for %s: %s" path msg))))
-                (funcall callback result nil))
+              (lambda (_result)
+                ;; Cache entries arrive as fs/entryInfo notifications,
+                ;; not in the response.
+                (funcall callback t nil))
               (lambda (err)
                 (flit--log-error "Async batch prefetch failed for %s: %s" host err)
                 (funcall callback nil (format "%s" err))))
