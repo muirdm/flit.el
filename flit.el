@@ -113,7 +113,7 @@ Low-level modes (no auto-deploy):
     A function called with (HOST CALLBACK) where CALLBACK expects
     (METHOD ERROR-MSG).
 
-The optional :handshake FN is called asynchronously before JSON-RPC starts.
+The optional :handshake FN is called asynchronously before flitrpc starts.
 Signature: (FN HOST PROC CALLBACK) where:
 - HOST is the flit host name
 - PROC is the Emacs process object
@@ -146,7 +146,7 @@ Example configuration:
   :group 'flit)
 
 (defcustom flit-timeout 5
-  "Default timeout in seconds for flit operations (e.g., JSON-RPC requests)."
+  "Default timeout in seconds for flit RPC operations."
   :type 'integer
   :group 'flit)
 
@@ -179,11 +179,6 @@ Useful for debugging specific files, e.g.:
                  (function :tag "Predicate function"))
   :group 'flit)
 
-(defcustom flit-log-events nil
-  "Enable JSON-RPC event logging to *flit-HOST events* buffer.
-When nil (default), the verbose RPC traffic log is suppressed."
-  :type 'boolean
-  :group 'flit)
 
 ;;; Logging
 
@@ -589,7 +584,7 @@ Returns the expanded path."
 \\{flit-status-mode-map}")
 
 (defvar flit--connections (make-hash-table :test 'equal)
-  "Hash table mapping host to jsonrpc-connection object.")
+  "Hash table mapping host to flit-connection object.")
 
 (defvar flit--connection-states (make-hash-table :test 'equal)
   "Hash table mapping host to connection state.
@@ -1027,12 +1022,12 @@ hash lookup instead of flit--get-connection to avoid side effects."
 (advice-add 'process-send-eof :around #'flit--process-send-eof-advice)
 
 ;; Advise accept-process-output to handle flit processes.
-;; Our pipe processes don't receive output directly - output comes via jsonrpc
+;; Our pipe processes don't receive output directly - output comes via flitrpc
 ;; notifications on the flit connection. So we poll the connection until
 ;; output arrives for the specific process we're waiting on.
 (defun flit--accept-process-output-advice (orig-fn &optional process timeout timeout-msecs just-this-one)
   "Handle accept-process-output for flit processes.
-For flit processes, poll the jsonrpc connection until this specific
+For flit processes, poll the flitrpc connection until this specific
 process receives output, or until timeout expires."
   (if (and (processp process)
            (process-get process 'flit-proc-id))
@@ -1376,7 +1371,7 @@ via `flit--allow-prompt-p'."
           (flit--set-connection-state host 'failed))))))
 
 (defun flit--get-connection (host)
-  "Get or create a jsonrpc connection to HOST.
+  "Get or create a connection to HOST.
 Behavior depends on `flit--connection-tier' (must be bound by caller):
 - `connect': Attempts sync connection (find-file/dired minibuffer)
 - `passive': Only returns existing live connections, never initiates new ones
@@ -2011,7 +2006,7 @@ SPEC can be nil (use HOST), a string (explicit hostname),
 or a function (called with HOST, returns transport args list).
 
 All connection types support :handshake FN which is called with the
-process before JSON-RPC starts.
+process before flitrpc starts.
 
 A function or process can also be used directly as METHOD.
 
@@ -2318,7 +2313,7 @@ Emacs expects raw paths from exec-path and adds the remote prefix itself."
 
 (defun flit--handle-notification (conn method params)
   "Handle a server notification METHOD with PARAMS from CONN."
-  ;; Skip logging exec/output and log - too noisy, use flit-log-events for RPC details
+  ;; Skip logging exec/output and log - too noisy
   (unless (memq method '(exec/output log))
     (flit--log-debug "Notification: %s %S" method params))
   (let ((start-time (float-time)))
@@ -2369,7 +2364,7 @@ Server logs are forwarded via RPC and displayed in the flit log buffer."
 
 (defun flit--handle-request (_conn method _params)
   "Handle a server request.
-METHOD is the JSON-RPC method name."
+METHOD is the RPC method name."
   (pcase method
     ("heartbeat" t)  ; Just return true to acknowledge
     (_ nil)))
@@ -2568,7 +2563,7 @@ PARAMS contains :procId and :exitCode."
     (when sentinel
       (funcall sentinel proc event))))
 
-;;; JSON-RPC
+;;; RPC helpers
 
 (defun flit--format-rpc-result-extra (method result)
   "Format extra info for RPC RESULT based on METHOD."
@@ -5045,7 +5040,7 @@ Delegates to our start-file-process handler."
 (defun flit--set-process-window-size-advice (orig-fun process height width)
   "Resize flit PTY processes via the server."
   (if (process-get process 'flit-pty)
-      ;; Resize async and ignore errors, otherwise things can block and jsonrpc errors can
+      ;; Resize async and ignore errors, otherwise things can block and RPC errors can
       ;; propagate unfortunately.
       (when-let* ((proc-id (flit--process-valid-for-rpc-p process "resize"))
                   (host (process-get process 'flit-host)))

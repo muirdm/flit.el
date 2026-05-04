@@ -1,6 +1,6 @@
 # flit.el
 
-Flit is a faster and less annoying TRAMP. flit.el connects over JSON-RPC to the flit server on the remote host.
+Flit is a faster and less annoying TRAMP. flit.el connects over a custom binary RPC protocol (flitrpc) to the flit server on the remote host.
 
 ## Quick Start
 
@@ -38,17 +38,15 @@ To compile the flit binary, you must have Go installed on your local host.
 
 There are bugs, including potential data loss if something really goes wrong. That being said, I daily drive it and haven't had issues.
 
-The flit server allows arbitrary command execution and filesystem operations over JSON-RPC with no authentication. I recommend only using the :et or :ssh connection methods, piggy backing on your existing authentication setup. The flit server is run in "oneshot" mode talking over stdio to Emacs. I am not a security expert, but this doesn't seem worse than TRAMP. Please open an issue if you have security advice.
+The flit server allows arbitrary command execution and filesystem operations over RPC with no authentication. I recommend only using the :et or :ssh connection methods, piggy backing on your existing authentication setup. The flit server is run in "oneshot" mode talking over stdio to Emacs. I am not a security expert, but this doesn't seem worse than TRAMP. Please open an issue if you have security advice.
 
 There will almost certainly be breaking changes to the public interface.
 
 ## Architecture
 
-flit.el connects to a flit server process on the remote host. flit.el establishes a bidirectional JSON-RPC connection over which all communication takes place. Filesystem operations and process/PTY creation all happen over the JSON-RPC connection.
+flit.el connects to a flit server process on the remote host. flit.el establishes a bidirectional RPC connection using flitrpc, a custom binary protocol with msgpack-encoded metadata and raw binary payloads. Filesystem operations and process/PTY creation all happen over this connection.
 
 To minimize round trips, flit.el aggressively caches file and directory information. The server watches for changes and pushes updates to flit.el.
-
-JSON-RPC was chosen simply because Emacs already has native JSON parsing and built-in JSON-RPC handling.
 
 ## Connection Methods
 
@@ -73,7 +71,7 @@ For ET, Flit uses a single persistent PTY connection. Auth prompts are presented
 
 Similarly :ssh can be used instead of :et. SSH mode will first try a non-PTY stdio SSH connection. On failure, :ssh will fall back to a PTY connection via the "flit pty-bridge" sidecar. This PTY fallback supports "flit" binary deployment and auth prompts.
 
-Lower level methods :stdio and :tcp are also available, which do not support auth prompts or auto deploy. Finally, a function can be provided to yield an arbitrary Emacs process ready for the JSON-RPC connection.
+Lower level methods :stdio and :tcp are also available, which do not support auth prompts or auto deploy. Finally, a function can be provided to yield an arbitrary Emacs process ready for the RPC connection.
 
 ## User Interface
 
@@ -128,12 +126,10 @@ Flit tries to prefetch and be async where possible, but some things will always 
 
 File change detection and auto revert work to a certain degree, but there will be a long tail of bugs in this area.
 
-The pty communcation is versatile, but fragile. Stdout and stderr are not separated, so the JSON-RPC connection gets stuck with any unexpected output sneaking in.
+The pty communication is versatile, but fragile. The flitrpc connection can get stuck with any unexpected output sneaking in on stdout.
 
 ## Debugging
 
 Check the `*flit-log*` buffer for detailed goings on. Log messages from the flit server also show up here. Set `flit-log-level` to `'debug` or `'trace` to see more logs, optionally paired with `flit-log-filter` to zero in on a particular subject.
-
-Enable `flit-log-events` to turn on jsonrpc.el logging to the events buffer.
 
 Logging from the "flit pty-bridge" sidecar shows up in the `*flit-stderr-HOST*` buffer.
