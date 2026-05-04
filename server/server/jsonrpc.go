@@ -1303,9 +1303,8 @@ func (s *Server) HandleConnection(conn net.Conn) {
 
 // ReadyMessage is sent to stdout in stdio mode to signal the server is ready
 type ReadyMessage struct {
-	FlitReady bool   `json:"flit_ready"`
-	Version   string `json:"version"`
-	Protocol  string `json:"protocol,omitempty"`
+	FlitReady    bool `json:"flit_ready"`
+	ProtoVersion int  `json:"proto_version"`
 }
 
 // HandleStdio handles flitrpc over stdin/stdout
@@ -1318,7 +1317,7 @@ func (s *Server) HandleStdio(stdin io.Reader, stdout io.Writer) {
 	}
 
 	// Send ready message as JSON line (pre-protocol)
-	readyMsg := ReadyMessage{FlitReady: true, Version: "2.0", Protocol: "flitrpc"}
+	readyMsg := ReadyMessage{FlitReady: true, ProtoVersion: 1}
 	readyBytes, _ := json.Marshal(readyMsg)
 	stdout.Write(readyBytes)
 	stdout.Write([]byte("\n"))

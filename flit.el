@@ -1794,6 +1794,19 @@ Cleans up SM, kills PROC, calls CALLBACK with error."
   (process-put proc 'flit-sm-pending nil)
   (process-put proc 'flit-sm-timer nil))
 
+(defconst flit--proto-version 1
+  "Expected flitrpc protocol version.
+Bump when making breaking wire format changes.")
+
+(defun flit--check-proto-version (proc json-obj callback host)
+  "Check proto_version in JSON-OBJ, then complete or fail the handshake."
+  (let ((server-version (plist-get json-obj :proto_version)))
+    (if (eq server-version flit--proto-version)
+        (flit--sm-complete proc callback)
+      (flit--sm-fail proc callback
+                     (format "Server protocol version %s does not match client version %d. Redeploy the server binary."
+                             (or server-version "missing") flit--proto-version)))))
+
 ;;; Handshake state handlers
 
 (defun flit--hs-waiting-ready (host callback handle-password deploy-handler
@@ -1805,12 +1818,12 @@ All parameters are captured in the closure."
      ;; Ready signal from flit server
      ((and json-obj (plist-get json-obj :flit_ready))
       (flit--log-info "handshake[%s]: flit_ready received" host)
-      (flit--sm-complete proc callback))
+      (flit--check-proto-version proc json-obj callback host))
 
      ;; Deploy completion signal
      ((and json-obj (plist-get json-obj :flit_deploy_done))
       (flit--log-info "handshake[%s]: Deploy complete" host)
-      (flit--sm-complete proc callback))
+      (flit--check-proto-version proc json-obj callback host))
 
      ;; Password prompt
      ((and json-obj (plist-get json-obj :pty_password_prompt))
