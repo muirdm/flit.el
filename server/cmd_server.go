@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"os/signal"
 	"runtime"
 	"syscall"
@@ -43,13 +44,23 @@ func runServer(args []string) {
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, `Usage: flit server [options]
 
-Start the JSON-RPC server for remote file operations.
+Start the flitrpc server for remote file operations.
 
 Options:`)
 		fs.PrintDefaults()
 	}
 
 	fs.Parse(args)
+
+	// Redirect stderr to a crash log so panics are captured.
+	// Truncate on startup so only the last crash is kept.
+	if crashLog, err := crashLogPath(); err == nil {
+		if f, err := os.Create(crashLog); err == nil {
+			os.Stderr = f
+			// Also redirect fd 2 so runtime panics go to the file
+			syscall.Dup2(int(f.Fd()), 2)
+		}
+	}
 
 	// Configure slog level based on flags
 	var level slog.Level
@@ -160,4 +171,14 @@ Options:`)
 		slog.Info("New connection", "remote", conn.RemoteAddr())
 		go srv.HandleConnection(conn)
 	}
+}
+
+func crashLogPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(home, ".local", "share", "flit")
+	os.MkdirAll(dir, 0755)
+	return filepath.Join(dir, "crash.log"), nil
 }
