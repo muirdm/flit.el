@@ -560,45 +560,45 @@ freely change current-buffer without corrupting the parse loop."
 PAYLOAD-DATA is the extracted payload string, or nil."
   (let ((msg-type (plist-get meta :t))
         (id (plist-get meta :id)))
-    ;; Chunked first frame: seed chunks table, don't dispatch yet
-    (when (plist-get meta :chunked)
-      (puthash id (cons meta (if payload-data (list payload-data) nil))
-               (flitrpc-conn-chunks conn))
-      (cl-return-from flitrpc--dispatch-frame))
-    (pcase msg-type
-      ;; Response
-      ((pred (= flitrpc--type-response))
-       (let ((err (plist-get meta :error)))
-         (if err
-             (flitrpc--complete-request conn id nil err)
-           (flitrpc--complete-request conn id meta nil payload-data))))
-      ;; Notification — use condition-case-unless-debug so errors in one
-      ;; notification don't abort processing of subsequent frames, but
-      ;; the debugger still triggers when debug-on-error is set.
-      ((pred (= flitrpc--type-notification))
-       (when-let ((fn (flitrpc-conn-notification-fn conn)))
-         (let ((method (plist-get meta :method))
-               (params (plist-get meta :params)))
-           (condition-case-unless-debug err
-               (funcall fn conn method params payload-data)
-             (error
-              (message "flitrpc: error in notification %s: %s"
-                       method (error-message-string err)))))))
-      ;; Request (server -> client, e.g. heartbeat)
-      ((pred (= flitrpc--type-request))
-       (let* ((method (plist-get meta :method))
-              (params (plist-get meta :params))
-              (req-fn (flitrpc-conn-request-fn conn))
-              (result (if req-fn (funcall req-fn conn method params) t)))
-         (flitrpc--write-frame conn
-                               flitrpc--type-response id
-                               (list :result result))))
-      ;; Chunk continue
-      ((pred (= flitrpc--type-chunk-continue))
-       (flitrpc--accumulate-chunk-data conn id payload-data))
-      ;; Chunk end
-      ((pred (= flitrpc--type-chunk-end))
-       (flitrpc--finish-chunks conn id)))))
+    ;; Chunked first frame: seed chunks table with :chunked stripped, don't dispatch yet
+    (if (plist-get meta :chunked)
+        (let ((clean-meta (plist-put (copy-sequence meta) :chunked nil)))
+          (puthash id (cons clean-meta (if payload-data (list payload-data) nil))
+                   (flitrpc-conn-chunks conn)))
+      (pcase msg-type
+        ;; Response
+        ((pred (= flitrpc--type-response))
+         (let ((err (plist-get meta :error)))
+           (if err
+               (flitrpc--complete-request conn id nil err)
+             (flitrpc--complete-request conn id meta nil payload-data))))
+        ;; Notification — use condition-case-unless-debug so errors in one
+        ;; notification don't abort processing of subsequent frames, but
+        ;; the debugger still triggers when debug-on-error is set.
+        ((pred (= flitrpc--type-notification))
+         (when-let ((fn (flitrpc-conn-notification-fn conn)))
+           (let ((method (plist-get meta :method))
+                 (params (plist-get meta :params)))
+             (condition-case-unless-debug err
+                 (funcall fn conn method params payload-data)
+               (error
+                (message "flitrpc: error in notification %s: %s"
+                         method (error-message-string err)))))))
+        ;; Request (server -> client, e.g. heartbeat)
+        ((pred (= flitrpc--type-request))
+         (let* ((method (plist-get meta :method))
+                (params (plist-get meta :params))
+                (req-fn (flitrpc-conn-request-fn conn))
+                (result (if req-fn (funcall req-fn conn method params) t)))
+           (flitrpc--write-frame conn
+                                 flitrpc--type-response id
+                                 (list :result result))))
+        ;; Chunk continue
+        ((pred (= flitrpc--type-chunk-continue))
+         (flitrpc--accumulate-chunk-data conn id payload-data))
+        ;; Chunk end
+        ((pred (= flitrpc--type-chunk-end))
+         (flitrpc--finish-chunks conn id))))))
 
 (defun flitrpc--complete-request (conn id meta err &optional payload-data)
   "Complete pending request ID on CONN with META/ERR."
