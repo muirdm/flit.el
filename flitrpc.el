@@ -552,12 +552,18 @@ ARGS are keyword args: :notification-fn, :request-fn, :on-shutdown."
          (if err
              (flitrpc--complete-request conn id nil err)
            (flitrpc--complete-request conn id meta nil payload-start payload-end))))
-      ;; Notification
+      ;; Notification — use condition-case-unless-debug so errors in one
+      ;; notification don't abort processing of subsequent frames, but
+      ;; the debugger still triggers when debug-on-error is set.
       ((pred (= flitrpc--type-notification))
        (when-let ((fn (flitrpc-conn-notification-fn conn)))
          (let ((method (plist-get meta :method))
                (params (plist-get meta :params)))
-           (funcall fn conn method params payload-start payload-end))))
+           (condition-case-unless-debug err
+               (funcall fn conn method params payload-start payload-end)
+             (error
+              (message "flitrpc: error in notification %s: %s"
+                       method (error-message-string err)))))))
       ;; Request (server -> client, e.g. heartbeat)
       ((pred (= flitrpc--type-request))
        (let* ((method (plist-get meta :method))

@@ -248,6 +248,11 @@ func handleAuthAndWaitForReady(ptmx *os.File, writer io.Writer, reader *bufio.Re
 				return pendingStr, nil
 			}
 
+			if _, ok := obj["flit_deploy_done"]; ok {
+				slog.Info("Deploy done signal detected")
+				return pendingStr, nil
+			}
+
 			if _, ok := obj["flit_not_found"]; ok {
 				slog.Info("Deploy signal detected", "line", cleaned)
 				if err := handleDeploy(cleaned, ptmx, writer, reader); err != nil {

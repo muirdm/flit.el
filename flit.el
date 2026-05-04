@@ -25,9 +25,7 @@
 ;;; Code:
 
 (require 'cl-lib)
-(require 'json)
 (require 'flitrpc)
-(require 'eieio)
 
 ;; Forward declarations for variables defined later in the file.
 ;; These are needed because the public API section uses them before
