@@ -1665,9 +1665,10 @@ If not found and interactive, offer to compile."
    "mkdir -p ~/.local/share/flit; "
    "stty raw -echo; "
    "printf 'deploy_ready\\n'; "
-   "head -c \"$DEPLOY_SIZE\" > \"$FLIT\"; "
+   "head -c \"$DEPLOY_SIZE\" > \"$FLIT.tmp\"; "
    "stty sane; "
-   "chmod +x \"$FLIT\"; "
+   "chmod +x \"$FLIT.tmp\"; "
+   "mv -f \"$FLIT.tmp\" \"$FLIT\"; "
    "fi; "
    "stty raw -echo && exec \"$FLIT\" server --stdio"))
 
@@ -1679,9 +1680,10 @@ If not found and interactive, offer to compile."
    "mkdir -p ~/.local/share/flit; "
    "stty raw -echo; "
    "printf 'deploy_ready\\n'; "
-   "head -c \"$DEPLOY_SIZE\" > ~/.local/share/flit/flit; "
+   "head -c \"$DEPLOY_SIZE\" > ~/.local/share/flit/flit.tmp; "
    "stty sane; "
-   "chmod +x ~/.local/share/flit/flit; "
+   "chmod +x ~/.local/share/flit/flit.tmp; "
+   "mv -f ~/.local/share/flit/flit.tmp ~/.local/share/flit/flit; "
    "echo '{\"flit_deploy_done\":true}'"))
 
 ;;; Process filter state machine
