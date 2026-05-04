@@ -522,40 +522,38 @@ ARGS are keyword args: :notification-fn, :request-fn, :on-shutdown."
 
 (defun flitrpc--parse-frames (conn)
   "Parse all complete frames from CONN's buffer.
-Safe for re-entrant calls: each frame is deleted from the buffer
-before dispatch, so nested parse calls (from sync RPCs triggered
-by notification callbacks) see a clean buffer."
+Each frame is read and deleted from the buffer, then dispatched.
+Dispatch happens outside `with-current-buffer' so handlers can
+freely change current-buffer without corrupting the parse loop."
   (let ((buf (flitrpc-conn-buffer conn)))
-    (with-current-buffer buf
-      (catch 'flitrpc--incomplete
-        (while t
-          (goto-char (point-min))
-          (when (< (- (point-max) (point)) flitrpc--header-size)
-            (throw 'flitrpc--incomplete nil))
-          (let* ((hdr-start (point))
-                 (meta-len (flitrpc--read-u32-at buf hdr-start))
-                 (payload-len (flitrpc--read-u32-at buf (+ hdr-start 4)))
-                 (frame-len (+ flitrpc--header-size meta-len payload-len)))
-            (when (< (- (point-max) hdr-start) frame-len)
+    (catch 'flitrpc--incomplete
+      (while t
+        (let (meta payload-data)
+          ;; Read and delete frame in the flitrpc buffer
+          (with-current-buffer buf
+            (goto-char (point-min))
+            (when (< (- (point-max) (point)) flitrpc--header-size)
               (throw 'flitrpc--incomplete nil))
-            (let* ((meta-start (+ hdr-start flitrpc--header-size))
-                   (meta-pair (flitrpc--read-msgpack buf meta-start))
-                   (meta (car meta-pair))
-                   (payload-start (+ meta-start meta-len))
-                   (payload-end (+ payload-start payload-len))
-                   ;; Extract payload before deleting the frame
-                   (payload-data (when (> payload-len 0)
-                                   (buffer-substring-no-properties
-                                    payload-start payload-end))))
-              ;; Delete frame from buffer BEFORE dispatch so re-entrant
-              ;; calls (from sync RPCs in notification callbacks) don't
-              ;; re-process this frame.
-              (delete-region (point-min) payload-end)
-              (flitrpc--dispatch-frame conn meta payload-data)
-              ;; If a sync request just completed, stop processing.
-              (when (flitrpc-conn-sync-done conn)
-                (setf (flitrpc-conn-sync-done conn) nil)
-                (throw 'flitrpc--incomplete nil)))))))))
+            (let* ((hdr-start (point))
+                   (meta-len (flitrpc--read-u32-at buf hdr-start))
+                   (payload-len (flitrpc--read-u32-at buf (+ hdr-start 4)))
+                   (frame-len (+ flitrpc--header-size meta-len payload-len)))
+              (when (< (- (point-max) hdr-start) frame-len)
+                (throw 'flitrpc--incomplete nil))
+              (let* ((meta-start (+ hdr-start flitrpc--header-size))
+                     (meta-pair (flitrpc--read-msgpack buf meta-start))
+                     (payload-start (+ meta-start meta-len))
+                     (payload-end (+ payload-start payload-len)))
+                (setq meta (car meta-pair))
+                (when (> payload-len 0)
+                  (setq payload-data (buffer-substring-no-properties
+                                      payload-start payload-end)))
+                (delete-region (point-min) payload-end))))
+          ;; Dispatch outside with-current-buffer
+          (flitrpc--dispatch-frame conn meta payload-data)
+          (when (flitrpc-conn-sync-done conn)
+            (setf (flitrpc-conn-sync-done conn) nil)
+            (throw 'flitrpc--incomplete nil)))))))
 
 (defun flitrpc--dispatch-frame (conn meta payload-data)
   "Dispatch a parsed frame from CONN.
