@@ -1270,12 +1270,8 @@ func (s *Server) HandleConnection(conn net.Conn) {
 		slog.Error("Failed to init watcher", "error", err)
 	}
 
-	// Wrap writer with async buffer (see HandleStdio for rationale)
-	aw := newAsyncWriter(conn)
-	defer aw.Close()
-
 	// Create flitrpc server
-	rpc := flitrpc.NewServer(conn, aw, slog.Default())
+	rpc := flitrpc.NewServer(conn, conn, slog.Default())
 	s.registerHandlers(rpc, sess)
 	sess.SetNotifier(
 		func(ctx context.Context, method string, params any) error {
@@ -1322,12 +1318,8 @@ func (s *Server) HandleStdio(stdin io.Reader, stdout io.Writer) {
 	stdout.Write(readyBytes)
 	stdout.Write([]byte("\n"))
 
-	// Wrap stdout with async buffer to prevent bidirectional pipe deadlocks
-	aw := newAsyncWriter(stdout)
-	defer aw.Close()
-
 	// Create flitrpc server
-	rpc := flitrpc.NewServer(stdin, aw, slog.Default())
+	rpc := flitrpc.NewServer(stdin, stdout, slog.Default())
 	s.registerHandlers(rpc, sess)
 	sess.SetNotifier(
 		func(ctx context.Context, method string, params any) error {
@@ -1383,59 +1375,3 @@ func (wc writeCloser) Close() error {
 	return nil
 }
 
-// asyncWriter wraps an io.Writer with a buffered async queue so that
-// writes never block. This prevents bidirectional pipe deadlocks where
-// jrpc2 notification senders (tunnel readLoop, fs watcher, exec output)
-// block on a full buffer, cascading through jrpc2's internal queues to
-// block the stdin reader, while Emacs is blocked writing to stdin
-// because stdout isn't being drained.
-//
-// If the buffer fills up (client not reading), Write returns an error
-// which propagates to the caller (e.g. tunnel readLoop, exec output
-// callback) causing them to close cleanly.
-type asyncWriter struct {
-	ch   chan []byte
-	done chan struct{}
-	err  error
-}
-
-var errWriteQueueFull = fmt.Errorf("async write queue full — client not reading")
-
-func newAsyncWriter(w io.Writer) *asyncWriter {
-	aw := &asyncWriter{
-		ch:   make(chan []byte, 1024),
-		done: make(chan struct{}),
-	}
-	go func() {
-		defer close(aw.done)
-		for data := range aw.ch {
-			if _, err := w.Write(data); err != nil {
-				aw.err = err
-				for range aw.ch {
-				}
-				return
-			}
-		}
-	}()
-	return aw
-}
-
-func (aw *asyncWriter) Write(p []byte) (int, error) {
-	if aw.err != nil {
-		return 0, aw.err
-	}
-	data := make([]byte, len(p))
-	copy(data, p)
-	select {
-	case aw.ch <- data:
-		return len(p), nil
-	default:
-		return 0, errWriteQueueFull
-	}
-}
-
-func (aw *asyncWriter) Close() error {
-	close(aw.ch)
-	<-aw.done
-	return aw.err
-}
