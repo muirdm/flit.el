@@ -143,6 +143,39 @@ func (fw *Writer) writeRaw(metaBuf, payload []byte) error {
 	return nil
 }
 
+const chunkSize = 256 * 1024 // 256KB chunks for multiplexing
+
+// writeChunked writes a message with a large payload as multiple frames,
+// releasing the mutex between chunks so other messages can interleave.
+func (fw *Writer) writeChunked(metaBuf []byte, payload []byte) error {
+	// First frame: metadata + first chunk of payload
+	first := payload
+	if len(first) > chunkSize {
+		first = payload[:chunkSize]
+	}
+	if err := fw.writeRaw(metaBuf, first); err != nil {
+		return err
+	}
+	payload = payload[len(first):]
+
+	// Continuation frames
+	for len(payload) > 0 {
+		chunk := payload
+		if len(chunk) > chunkSize {
+			chunk = payload[:chunkSize]
+		}
+		contMeta, _ := marshalMsgpack(map[string]any{"t": TypeChunkContinue})
+		if err := fw.writeRaw(contMeta, chunk); err != nil {
+			return err
+		}
+		payload = payload[len(chunk):]
+	}
+
+	// End frame
+	endMeta, _ := marshalMsgpack(map[string]any{"t": TypeChunkEnd})
+	return fw.writeRaw(endMeta, nil)
+}
+
 // Handler processes an RPC request and returns a result.
 // Params is raw msgpack bytes for the "params" field.
 type Handler func(params msgpack.RawMessage, payload []byte) (result any, resultPayload []byte, err error)
@@ -214,17 +247,21 @@ func (s *Server) Notify(method string, params any) error {
 
 // NotifyWithPayload sends a notification with optional binary payload.
 func (s *Server) NotifyWithPayload(method string, params any, payload []byte) error {
-	// Build a minimal meta map and encode the params directly via
-	// msgpack (not via JSON roundtrip which loses int/float distinction).
 	metaMap := map[string]any{
 		"t":      TypeNotification,
 		"id":     0,
 		"method": method,
 		"params": params,
 	}
+	if len(payload) > chunkSize {
+		metaMap["chunked"] = true
+	}
 	metaBuf, err := marshalMsgpack(metaMap)
 	if err != nil {
 		return fmt.Errorf("flitrpc: encoding notification: %w", err)
+	}
+	if len(payload) > chunkSize {
+		return s.writer.writeChunked(metaBuf, payload)
 	}
 	return s.writer.writeRaw(metaBuf, payload)
 }
@@ -318,13 +355,22 @@ func (s *Server) sendResult(id int64, result any, payload []byte) {
 		"id":     id,
 		"result": result,
 	}
+	if len(payload) > chunkSize {
+		metaMap["chunked"] = true
+	}
 	metaBuf, err := marshalMsgpack(metaMap)
 	if err != nil {
 		s.logger.Error("flitrpc: failed to encode response", "id", id, "error", err)
 		return
 	}
-	if err := s.writer.writeRaw(metaBuf, payload); err != nil {
-		s.logger.Error("flitrpc: failed to send response", "id", id, "error", err)
+	if len(payload) > chunkSize {
+		if err := s.writer.writeChunked(metaBuf, payload); err != nil {
+			s.logger.Error("flitrpc: failed to send chunked response", "id", id, "error", err)
+		}
+	} else {
+		if err := s.writer.writeRaw(metaBuf, payload); err != nil {
+			s.logger.Error("flitrpc: failed to send response", "id", id, "error", err)
+		}
 	}
 }
 

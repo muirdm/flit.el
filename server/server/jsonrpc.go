@@ -159,7 +159,8 @@ type WatchMeta struct {
 
 // Session holds per-connection state (file watcher, process manager, etc.)
 type Session struct {
-	notify        func(ctx context.Context, method string, params any) error
+	notify            func(ctx context.Context, method string, params any) error
+	notifyWithPayload func(ctx context.Context, method string, params any, payload []byte) error
 	logger        *slog.Logger // Logger that sends logs via RPC
 	watcher       *fs.Watcher
 	edenWatcher   *eden.Watcher
@@ -185,14 +186,13 @@ func NewSession(logLevel slog.Level) *Session {
 	sess.procManager = exec.NewManager(
 		// onOutput callback
 		func(procID string, stream string, data []byte) {
-			if sess.notify != nil {
+			if sess.notifyWithPayload != nil {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
-				if err := sess.notify(ctx, "exec/output", map[string]any{
+				if err := sess.notifyWithPayload(ctx, "exec/output", map[string]any{
 					"procId": procID,
 					"stream": stream,
-					"data":   data,
-				}); err != nil {
+				}, data); err != nil {
 					sess.logger.Error("exec/output notification failed", "error", err)
 				}
 			}
@@ -217,8 +217,9 @@ func NewSession(logLevel slog.Level) *Session {
 }
 
 // SetNotifier configures notification delivery and creates the RPC logger.
-func (sess *Session) SetNotifier(notify func(ctx context.Context, method string, params any) error) {
+func (sess *Session) SetNotifier(notify func(ctx context.Context, method string, params any) error, notifyWithPayload func(ctx context.Context, method string, params any, payload []byte) error) {
 	sess.notify = notify
+	sess.notifyWithPayload = notifyWithPayload
 	// Create RPC logger that sends logs to client
 	rpcHandler := NewRPCLogHandler(sess.logLevel, notify)
 	sess.logger = slog.New(rpcHandler)
@@ -647,16 +648,21 @@ func (sess *Session) sendFileChangedNotification(path, eventType string, fsHandl
 		return
 	}
 
-	var notification interface{}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	if eventType == "deleted" || info == nil {
-		notification = map[string]interface{}{
+		sess.notify(ctx, "fs/changed", map[string]interface{}{
 			"path":  path,
 			"type":  eventType,
 			"cache": []fs.CacheEntry{},
-		}
+		})
 	} else {
+		// Extract content to payload
+		content := info.Content
+		info.Content = nil
 		cache := fs.BuildCacheEntries(info)
-		notification = struct {
+		notification := struct {
 			Path  string          `json:"path"`
 			Type  string          `json:"type"`
 			Cache []fs.CacheEntry `json:"cache"`
@@ -665,11 +671,8 @@ func (sess *Session) sendFileChangedNotification(path, eventType string, fsHandl
 			Type:  eventType,
 			Cache: cache,
 		}
+		sess.notifyWithPayload(ctx, "fs/changed", notification, content)
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	sess.notify(ctx, "fs/changed", notification)
 }
 
 // IsFileOpen returns true if the file is currently open in a client buffer
@@ -910,7 +913,10 @@ func (s *Server) registerHandlers(rpc *flitrpc.Server, sess *Session) {
 
 	// Filesystem operations
 	simple("fs/stat", s.fsHandler.Stat)
-	simple("fs/read", s.fsHandler.Read)
+	rpc.Handle("fs/read", func(params msgpack.RawMessage, _ []byte) (any, []byte, error) {
+		s.touch()
+		return s.fsHandler.Read(params)
+	})
 	simple("fs/mkdir", s.fsHandler.Mkdir)
 	simple("fs/delete", s.fsHandler.Delete)
 	simple("fs/rename", s.fsHandler.Rename)
@@ -942,13 +948,17 @@ func (s *Server) registerHandlers(rpc *flitrpc.Server, sess *Session) {
 	})
 
 	// fs/info with auto-watch and async child fetch
-	flitrpc.HandleTyped(rpc, "fs/info", func(params struct {
-		Path string `json:"path"`
-	}) (any, error) {
+	rpc.Handle("fs/info", func(raw msgpack.RawMessage, _ []byte) (any, []byte, error) {
 		s.touch()
+		var params struct {
+			Path string `json:"path"`
+		}
+		if err := flitrpc.UnmarshalParams(raw, &params); err != nil {
+			return nil, nil, err
+		}
 		result, err := s.fsHandler.GetInfoWithEntries(params.Path)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if result.Exists && result.Type == "file" {
 			sess.WatchFile(params.Path)
@@ -967,10 +977,13 @@ func (s *Server) registerHandlers(rpc *flitrpc.Server, sess *Session) {
 		if isNoWatchPath(params.Path) {
 			result.NoCache = true
 		}
+		// Extract content to payload
+		content := result.Content
+		result.Content = nil
 		return &fs.InfoResponse{
 			InfoResult: result,
 			Cache:      fs.BuildCacheEntries(result),
-		}, nil
+		}, content, nil
 	})
 
 	// fs/openDir with higher child limit
@@ -1264,9 +1277,13 @@ func (s *Server) HandleConnection(conn net.Conn) {
 	// Create flitrpc server
 	rpc := flitrpc.NewServer(conn, aw, slog.Default())
 	s.registerHandlers(rpc, sess)
-	sess.SetNotifier(func(ctx context.Context, method string, params any) error {
-		return rpc.Notify(method, params)
-	})
+	sess.SetNotifier(
+		func(ctx context.Context, method string, params any) error {
+			return rpc.Notify(method, params)
+		},
+		func(ctx context.Context, method string, params any, payload []byte) error {
+			return rpc.NotifyWithPayload(method, params, payload)
+		})
 
 	// Initialize Eden watcher after SetNotifier so it can use the session logger
 	sess.InitEdenWatcher(s.fsHandler)
@@ -1313,9 +1330,13 @@ func (s *Server) HandleStdio(stdin io.Reader, stdout io.Writer) {
 	// Create flitrpc server
 	rpc := flitrpc.NewServer(stdin, aw, slog.Default())
 	s.registerHandlers(rpc, sess)
-	sess.SetNotifier(func(ctx context.Context, method string, params any) error {
-		return rpc.Notify(method, params)
-	})
+	sess.SetNotifier(
+		func(ctx context.Context, method string, params any) error {
+			return rpc.Notify(method, params)
+		},
+		func(ctx context.Context, method string, params any, payload []byte) error {
+			return rpc.NotifyWithPayload(method, params, payload)
+		})
 
 	// Initialize Eden watcher after SetNotifier so it can use the session logger
 	sess.InitEdenWatcher(s.fsHandler)
