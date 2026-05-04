@@ -1884,10 +1884,10 @@ buffer in an unmodified state even though content differed from disk."
                 ;; Call RPC directly with the old expected mtime
                 (flit--with-parsed (host path) flit-path
                   (let* ((content "modified in emacs")
-                         (encoded (base64-encode-string content t))
+                         (raw-content (encode-coding-string content 'utf-8-unix))
                          (result (flit--send-request host "fs/write"
                                    `(:path ,path
-                                     :content ,encoded
+                                     :content (:bin . ,raw-content)
                                      :expectedMtime ,original-mtime))))
                     ;; Should get mismatch response
                     (should (eq (plist-get result :mismatch) t))
@@ -1912,10 +1912,10 @@ buffer in an unmodified state even though content differed from disk."
       ;; Now try to write with expectNotExist flag
       (flit--with-parsed (host path) flit-path
         (let* ((content "my new content")
-               (encoded (base64-encode-string content t))
+               (raw-content (encode-coding-string content 'utf-8-unix))
                (result (flit--send-request host "fs/write"
                          `(:path ,path
-                           :content ,encoded
+                           :content (:bin . ,raw-content)
                            :expectNotExist t))))
           ;; Should get mismatch response
           (should (eq (plist-get result :mismatch) t))
@@ -1940,10 +1940,10 @@ buffer in an unmodified state even though content differed from disk."
                                      (float-time (visited-file-modtime)))))
                 (flit--with-parsed (host path) flit-path
                   (let* ((content "modified content")
-                         (encoded (base64-encode-string content t))
+                         (raw-content (encode-coding-string content 'utf-8-unix))
                          (result (flit--send-request host "fs/write"
                                    `(:path ,path
-                                     :content ,encoded
+                                     :content (:bin . ,raw-content)
                                      :expectedMtime ,current-mtime))))
                     ;; Should NOT get mismatch
                     (should-not (plist-get result :mismatch))
@@ -1976,18 +1976,18 @@ buffer in an unmodified state even though content differed from disk."
                 ;; First write should return mismatch
                 (flit--with-parsed (host path) flit-path
                   (let* ((content "my new content")
-                         (encoded (base64-encode-string content t))
+                         (raw-content (encode-coding-string content 'utf-8-unix))
                          (result (flit--send-request host "fs/write"
                                    `(:path ,path
-                                     :content ,encoded
+                                     :content (:bin . ,raw-content)
                                      :expectedMtime ,original-mtime))))
                     (should (eq (plist-get result :mismatch) t)))
 
                   ;; Force write should succeed
                   (let* ((content "my new content")
-                         (encoded (base64-encode-string content t))
+                         (raw-content (encode-coding-string content 'utf-8-unix))
                          (result (flit--send-request host "fs/write"
-                                   `(:path ,path :content ,encoded :force t))))
+                                   `(:path ,path :content (:bin . ,raw-content) :force t))))
                     ;; Should succeed without mismatch
                     (should-not (plist-get result :mismatch))
                     ;; File should have our content now
@@ -2003,10 +2003,10 @@ buffer in an unmodified state even though content differed from disk."
       ;; Write with expectNotExist to a file that genuinely doesn't exist
       (flit--with-parsed (host path) flit-path
         (let* ((content "brand new content")
-               (encoded (base64-encode-string content t))
+               (raw-content (encode-coding-string content 'utf-8-unix))
                (result (flit--send-request host "fs/write"
                          `(:path ,path
-                           :content ,encoded
+                           :content (:bin . ,raw-content)
                            :expectNotExist t))))
           ;; Should NOT get mismatch
           (should-not (plist-get result :mismatch))
