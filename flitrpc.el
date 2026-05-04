@@ -471,7 +471,8 @@ PAYLOAD is an optional unibyte string of raw bytes."
   notification-fn ; function called for notifications: (fn method params payload-start payload-end)
   request-fn      ; function called for server->client requests: (fn method params) -> result
   chunks          ; hash table: id -> (meta . payload-parts) for chunked reassembly
-  on-shutdown)    ; function called when connection closes
+  on-shutdown     ; function called when connection closes
+  sync-done)      ; set to t when a sync request completes, to interrupt parsing
 
 (defun flitrpc-make-conn (process host &rest args)
   "Create a flitrpc connection over PROCESS for HOST.
@@ -538,7 +539,15 @@ ARGS are keyword args: :notification-fn, :request-fn, :on-shutdown."
                    (payload-start (+ meta-start meta-len))
                    (payload-end (+ payload-start payload-len)))
               (goto-char payload-end)
-              (flitrpc--dispatch-frame conn meta payload-start payload-end)))))
+              (flitrpc--dispatch-frame conn meta payload-start payload-end)
+              ;; If a sync request just completed, stop processing.
+              ;; Remaining frames stay in the buffer and are processed
+              ;; on the next accept-process-output, after the sync
+              ;; caller returns (giving make-process callers time to
+              ;; install their real process filter).
+              (when (flitrpc-conn-sync-done conn)
+                (setf (flitrpc-conn-sync-done conn) nil)
+                (throw 'flitrpc--incomplete nil))))))
       (delete-region (point-min) (point)))))
 
 (defun flitrpc--dispatch-frame (conn meta payload-start payload-end)
@@ -687,8 +696,11 @@ Nested calls work: each has its own done/result variables."
                                               :payload
                                               (with-current-buffer (flitrpc-conn-buffer conn)
                                                 (buffer-substring-no-properties ps pe)))))
+                       (setf (flitrpc-conn-sync-done conn) t)
                        (setq result meta done t))
-                     (lambda (e) (setq err e done t)))
+                     (lambda (e)
+                       (setf (flitrpc-conn-sync-done conn) t)
+                       (setq err e done t)))
     (while (not done)
       (when (> (float-time) deadline)
         (setq err '(:message "Timed out") done t))
