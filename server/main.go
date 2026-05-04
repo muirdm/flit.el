@@ -37,6 +37,8 @@ func main() {
 		runServer(os.Args[2:])
 	case "pty-bridge":
 		runPtyBridge(os.Args[2:])
+	case "version":
+		fmt.Println(protoVersion)
 	case "-h", "--help", "help":
 		printUsage()
 	default:
@@ -50,8 +52,9 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, `Usage: flit <command> [options]
 
 Commands:
-  server       Start the JSON-RPC server for remote file operations
+  server       Start the flitrpc server for remote file operations
   pty-bridge   Bridge stdin/stdout to a command running in a PTY
+  version      Print the protocol version number
 
 Run 'flit <command> -h' for help on a specific command.`)
 }

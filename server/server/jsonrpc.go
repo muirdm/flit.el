@@ -1313,7 +1313,7 @@ func (s *Server) HandleStdio(stdin io.Reader, stdout io.Writer) {
 	}
 
 	// Send ready message as JSON line (pre-protocol)
-	readyMsg := ReadyMessage{FlitReady: true, ProtoVersion: 1}
+	readyMsg := ReadyMessage{FlitReady: true, ProtoVersion: ProtoVersion}
 	readyBytes, _ := json.Marshal(readyMsg)
 	stdout.Write(readyBytes)
 	stdout.Write([]byte("\n"))
