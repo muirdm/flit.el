@@ -16,7 +16,7 @@
 package fs
 
 import (
-	"encoding/base64"
+
 	"encoding/json"
 	"fmt"
 	"io"
@@ -218,7 +218,7 @@ type ReadParams struct {
 
 // ReadResult represents the result of fs/read, combining content and stat info
 type ReadResult struct {
-	Content string     `json:"content"` // Always base64 encoded
+	Content []byte     `json:"content"` // Raw binary file content
 	Stat    InfoResult `json:"stat"`    // Full info including path/realpath/exists
 }
 
@@ -246,7 +246,7 @@ func (h *Handler) Read(params json.RawMessage) (interface{}, error) {
 	}
 
 	result := &ReadResult{
-		Content: base64.StdEncoding.EncodeToString(content),
+		Content: content,
 	}
 	result.Stat.Exists = true
 	result.Stat.Path = p.Path
@@ -637,9 +637,9 @@ type InfoResult struct {
 	Group  string `json:"group,omitempty"`
 	Nlink  uint64 `json:"nlink,omitempty"`
 	Target string `json:"target,omitempty"` // Symlink target
-	// Content (only for files < 1MB, always base64 encoded)
-	// nil = content not included, "" = empty file
-	Content *string `json:"content,omitempty"`
+	// Content (only for files < 1MB, raw binary)
+	// nil = content not included
+	Content []byte `json:"content,omitempty"`
 	// Directory children (only for directories) - name and isDir for each entry
 	// Individual child entries with full stat are sent via :cache for caching by full path
 	Children *[]DirChild `json:"children,omitempty"` // nil = no data, empty = empty dir
@@ -727,7 +727,7 @@ func (h *Handler) getInfo(path string) (*InfoResult, error) {
 	// For regular files < 1MB, include content
 	if result.Type == "file" && result.Size <= maxContentSize {
 		if content, err := os.ReadFile(path); err == nil {
-			result.Content = strPtr(base64.StdEncoding.EncodeToString(content))
+			result.Content = content
 			// Re-stat after reading content to catch metadata updates that may have
 			// propagated after the initial Lstat. This handles timing issues on
 			// filesystems like EdenFS where fsnotify events may fire before metadata
@@ -831,7 +831,7 @@ func (h *Handler) GetInfoWithEntries(path string) (*InfoResult, error) {
 	// For regular files < 1MB, include content
 	if result.Type == "file" && result.Size <= maxContentSize {
 		if content, err := os.ReadFile(path); err == nil {
-			result.Content = strPtr(base64.StdEncoding.EncodeToString(content))
+			result.Content = content
 			// Re-stat after reading content
 			if info2, err := os.Lstat(path); err == nil {
 				newMtime := info2.ModTime().Unix()

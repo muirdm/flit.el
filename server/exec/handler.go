@@ -17,7 +17,7 @@ package exec
 
 import (
 	"context"
-	"encoding/base64"
+
 	"fmt"
 	"io"
 	"log/slog"
@@ -31,7 +31,7 @@ import (
 )
 
 // OutputFunc is called when a process produces output
-type OutputFunc func(procID string, stream string, data string)
+type OutputFunc func(procID string, stream string, data []byte)
 
 // ExitFunc is called when a process exits
 type ExitFunc func(procID string, exitCode int)
@@ -278,15 +278,15 @@ func (m *Manager) Start(params StartParams) (*StartResult, error) {
 }
 
 // readOutput reads from a pipe and sends output notifications.
-// Data is base64-encoded to safely transport binary data over JSON.
 func (m *Manager) readOutput(procID string, stream string, r io.Reader) {
 	buf := make([]byte, 4096)
 	for {
 		n, err := r.Read(buf)
 		if n > 0 && m.onOutput != nil {
-			// Base64 encode to safely transport any binary data over JSON
-			encoded := base64.StdEncoding.EncodeToString(buf[:n])
-			m.onOutput(procID, stream, encoded)
+			// Send raw bytes — msgpack encodes []byte as binary natively
+			data := make([]byte, n)
+			copy(data, buf[:n])
+			m.onOutput(procID, stream, data)
 		}
 		if err != nil {
 			break

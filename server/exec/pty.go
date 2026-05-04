@@ -142,7 +142,9 @@ func (m *PTYManager) readOutput(ptyID string, r io.Reader) {
 		n, err := r.Read(buf)
 		if n > 0 && m.onOutput != nil {
 			// For PTY, we use "stdout" as the stream name
-			m.onOutput(ptyID, "stdout", string(buf[:n]))
+			data := make([]byte, n)
+			copy(data, buf[:n])
+			m.onOutput(ptyID, "stdout", data)
 		}
 		if err != nil {
 			break

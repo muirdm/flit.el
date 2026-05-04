@@ -1,5 +1,7 @@
 ;;; flitrpc.el --- Binary RPC protocol for flit -*- lexical-binding: t; -*-
 
+(require 'cl-lib)
+
 ;; Custom binary protocol replacing JSON-RPC.  Eliminates base64 overhead,
 ;; nested request deadlocks (jsonrpc.el bug#67945), and head-of-line blocking.
 ;;
@@ -240,6 +242,9 @@ Return (VALUE . NEW-POS).  Operates on unibyte buffer."
     (flitrpc--write-int value emit))
    ((floatp value)
     (flitrpc--write-float64 value emit))
+   ((and (consp value) (eq (car value) :bin))
+    ;; Explicit binary data wrapper — encode as msgpack bin
+    (flitrpc--write-bin-data (cdr value) emit))
    ((stringp value)
     (flitrpc--write-str value emit))
    ((vectorp value)
@@ -334,6 +339,22 @@ Return (VALUE . NEW-POS).  Operates on unibyte buffer."
            (b7 (logand frac-lo #xff)))
       (unibyte-string b0 b1 b2 b3 b4 b5 b6 b7))))
 
+(defun flitrpc--write-bin-data (s emit)
+  "Serialize unibyte string S as msgpack bin."
+  (let ((len (length s)))
+    (cond
+     ((<= len #xff)
+      (funcall emit (unibyte-string #xc4 len)))
+     ((<= len #xffff)
+      (funcall emit (unibyte-string #xc5 (ash len -8) (logand len #xff))))
+     (t
+      (funcall emit (unibyte-string #xc6
+                                    (logand (ash len -24) #xff)
+                                    (logand (ash len -16) #xff)
+                                    (logand (ash len -8) #xff)
+                                    (logand len #xff)))))
+    (funcall emit s)))
+
 (defun flitrpc--write-str (s emit)
   "Serialize string S."
   (let* ((encoded (encode-coding-string s 'utf-8))
@@ -405,8 +426,8 @@ Return (VALUE . NEW-POS).  Operates on unibyte buffer."
 (defconst flitrpc--magic #x464C5452
   "Magic bytes \"FLTR\" as u32.")
 
-(defconst flitrpc--header-size 12
-  "Frame header size in bytes.")
+(defconst flitrpc--header-size 8
+  "Frame header size in bytes (meta_len + payload_len).")
 
 (defconst flitrpc--type-request 1)
 (defconst flitrpc--type-response 2)
@@ -414,16 +435,16 @@ Return (VALUE . NEW-POS).  Operates on unibyte buffer."
 (defconst flitrpc--type-chunk-continue 4)
 (defconst flitrpc--type-chunk-end 5)
 
-(defun flitrpc--write-frame (process msg-type id meta &optional payload)
-  "Write a frame to PROCESS.
+(defun flitrpc--write-frame (conn msg-type id meta &optional payload)
+  "Write a frame to CONN's process.
 MSG-TYPE is 1-5.  ID is the message id.  META is a plist.
 PAYLOAD is an optional unibyte string of raw bytes."
-  (let* ((full-meta (plist-put (plist-put (copy-sequence meta) :t msg-type) :id id))
+  (let* ((process (flitrpc-conn-process conn))
+         (full-meta (plist-put (plist-put (copy-sequence meta) :t msg-type) :id id))
          (meta-bytes (flitrpc--write-msgpack full-meta))
          (meta-len (length meta-bytes))
          (payload-len (if payload (length payload) 0))
          (header (unibyte-string
-                  #x46 #x4C #x54 #x52  ; FLTR
                   (logand (ash meta-len -24) #xff)
                   (logand (ash meta-len -16) #xff)
                   (logand (ash meta-len -8) #xff)
@@ -505,12 +526,9 @@ ARGS are keyword args: :notification-fn, :request-fn, :on-shutdown."
       (catch 'flitrpc--incomplete
         (while (>= (- (point-max) (point)) flitrpc--header-size)
           (let* ((hdr-start (point))
-                 (magic (flitrpc--read-u32-at buf hdr-start))
-                 (meta-len (flitrpc--read-u32-at buf (+ hdr-start 4)))
-                 (payload-len (flitrpc--read-u32-at buf (+ hdr-start 8)))
+                 (meta-len (flitrpc--read-u32-at buf hdr-start))
+                 (payload-len (flitrpc--read-u32-at buf (+ hdr-start 4)))
                  (frame-len (+ flitrpc--header-size meta-len payload-len)))
-            (unless (= magic flitrpc--magic)
-              (error "flitrpc: bad magic 0x%08x at pos %d" magic hdr-start))
             (when (< (- (point-max) hdr-start) frame-len)
               (goto-char hdr-start)
               (throw 'flitrpc--incomplete nil))
@@ -546,7 +564,7 @@ ARGS are keyword args: :notification-fn, :request-fn, :on-shutdown."
               (params (plist-get meta :params))
               (req-fn (flitrpc-conn-request-fn conn))
               (result (if req-fn (funcall req-fn conn method params) t)))
-         (flitrpc--write-frame (flitrpc-conn-process conn)
+         (flitrpc--write-frame conn
                                flitrpc--type-response id
                                (list :result result))))
       ;; Chunk continue
@@ -621,7 +639,7 @@ ERROR-FN is called with (error-plist)."
   (let ((id (cl-incf (flitrpc-conn-next-id conn))))
     (puthash id (cons success-fn (or error-fn #'ignore))
              (flitrpc-conn-pending conn))
-    (flitrpc--write-frame (flitrpc-conn-process conn)
+    (flitrpc--write-frame conn
                           flitrpc--type-request id
                           (list :method method :params params))
     id))
@@ -631,7 +649,7 @@ ERROR-FN is called with (error-plist)."
   (let ((id (cl-incf (flitrpc-conn-next-id conn))))
     (puthash id (cons success-fn (or error-fn #'ignore))
              (flitrpc-conn-pending conn))
-    (flitrpc--write-frame (flitrpc-conn-process conn)
+    (flitrpc--write-frame conn
                           flitrpc--type-request id
                           (list :method method :params params)
                           payload)
@@ -639,7 +657,7 @@ ERROR-FN is called with (error-plist)."
 
 (defun flitrpc-notify (conn method params &optional payload)
   "Send notification to CONN (fire-and-forget)."
-  (flitrpc--write-frame (flitrpc-conn-process conn)
+  (flitrpc--write-frame conn
                         flitrpc--type-notification 0
                         (list :method method :params params)
                         payload))

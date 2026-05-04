@@ -17,7 +17,7 @@ package tunnel
 
 import (
 	"context"
-	"encoding/base64"
+
 	"fmt"
 	"io"
 	"log/slog"
@@ -294,11 +294,12 @@ func (c *Connection) readLoop() {
 	for {
 		n, err := c.conn.Read(buf)
 		if n > 0 {
-			encoded := base64.StdEncoding.EncodeToString(buf[:n])
-			c.manager.notify(context.Background(), "tunnel/data", map[string]string{
+			data := make([]byte, n)
+			copy(data, buf[:n])
+			c.manager.notify(context.Background(), "tunnel/data", map[string]any{
 				"tunnelId": c.TunnelID,
 				"connId":   c.ID,
-				"data":     encoded,
+				"data":     data,
 			})
 		}
 		if err != nil {
