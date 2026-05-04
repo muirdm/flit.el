@@ -1444,10 +1444,10 @@ Defaults to `passive' when `flit--connection-tier' is unbound.
 
 (defun flit--make-connection (host proc)
   "Create a flit-connection for HOST using PROC."
-  ;; Save any leftover data from the handshake filter (flitrpc frames
-  ;; that arrived in the same chunk as the ready message).
-  (let ((leftover (process-get proc 'flit-sm-pending)))
-    (let* ((conn (make-flit-connection :host host))
+  ;; Any leftover data from the handshake filter is discarded.
+  ;; It contains flitrpc binary frames that were corrupted by the
+  ;; handshake's UTF-8 coding system.
+  (let* ((conn (make-flit-connection :host host))
            (rpc (flitrpc-make-conn
                  proc host
                  :notification-fn
@@ -1469,13 +1469,7 @@ Defaults to `passive' when `flit--connection-tier' is unbound.
       (when (process-buffer proc)
         (with-current-buffer (process-buffer proc)
           (setq-local read-process-output-max (* 1024 1024))))
-      ;; Inject leftover handshake data into the flitrpc buffer
-      (when (and leftover (> (length leftover) 0))
-        (with-current-buffer (flitrpc-conn-buffer rpc)
-          (goto-char (point-max))
-          (insert leftover))
-        (flitrpc--parse-frames rpc))
-      conn)))
+    conn))
 
 ;;; Connection type: :stdio
 
