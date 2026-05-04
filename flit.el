@@ -1463,12 +1463,10 @@ Defaults to `passive' when `flit--connection-tier' is unbound.
            (rpc (flitrpc-make-conn
                  proc host
                  :notification-fn
-                 (lambda (rpc-conn method params ps pe)
-                   ;; Extract payload and attach as :payload on params
-                   (when (and ps pe (> pe ps))
-                     (let ((payload (with-current-buffer (flitrpc-conn-buffer rpc-conn)
-                                     (buffer-substring-no-properties ps pe))))
-                       (setq params (plist-put (copy-sequence params) :payload payload))))
+                 (lambda (_rpc-conn method params payload-data)
+                   (when payload-data
+                     (setq params (plist-put (copy-sequence params)
+                                            :payload payload-data)))
                    (flit--handle-notification conn (intern method) params))
                  :request-fn
                  (lambda (rpc-conn method _params)
@@ -2272,7 +2270,7 @@ Fetches sys/info and PATH dirs, caches results."
   (flit--log-info "Async initializing connection to %s" host)
   (flitrpc-request
    (flit-connection-rpc conn) "init" nil
-   (lambda (meta _ps _pe)
+   (lambda (meta _payload)
      (let ((result (plist-get meta :result)))
        (flit--log-info "Async RPC init success for %s" host)
        ;; Cache sys-info (everything except pathDirs)
@@ -2630,7 +2628,7 @@ ERROR-FN is called with the error on failure."
       (error "Cannot connect to flit-server on %s" host))
     (flit--log-info "RPC async %s %S" method (flit--sanitize-params-for-log params))
     (flitrpc-request (flit-connection-rpc conn) method params
-                     (lambda (meta _ps _pe)
+                     (lambda (meta _payload)
                        (funcall (or success-fn #'ignore) (plist-get meta :result)))
                      (or error-fn #'ignore))))
 
