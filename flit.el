@@ -2504,7 +2504,7 @@ PARAMS contains :procId, :stream, and :payload (raw bytes)."
          (data (or (plist-get params :payload) (plist-get params :data)))
          (proc (gethash proc-id flit--processes)))
     (flit--log-debug "exec-output: proc-id=%s stream=%s len=%d live=%s name=%s"
-                     proc-id stream (length data)
+                     proc-id stream (if data (length data) -1)
                      (and proc (process-live-p proc))
                      (and proc (process-name proc)))
     (when (and proc (process-live-p proc))
@@ -3008,10 +3008,16 @@ Returns an Emacs process object."
     proc))
 
 (defun flit--default-process-filter (proc output)
-  "Default filter that inserts OUTPUT into PROC's buffer."
+  "Default filter that inserts OUTPUT into PROC's buffer.
+Uses `inhibit-read-only' because flit delivers output manually via
+notification handlers, not through Emacs's internal process handling
+which sets inhibit-read-only itself.  The process buffer may be
+read-only (e.g., compilation-mode sets it before make-process returns
+and before the real filter is installed)."
   (when (buffer-live-p (process-buffer proc))
     (with-current-buffer (process-buffer proc)
-      (let* ((mark (process-mark proc))
+      (let* ((inhibit-read-only t)
+             (mark (process-mark proc))
              ;; Ensure mark is in this buffer
              (mark-pos (if (and (markerp mark)
                                 (eq (marker-buffer mark) (current-buffer)))
@@ -5006,7 +5012,8 @@ Delegates to our start-file-process handler."
                              (stderr-proc (make-pipe-process
                                            :name (format "%s-stderr" name)
                                            :buffer stderr-buf
-                                           :noquery t)))
+                                           :noquery t
+                                           :filter #'flit--default-process-filter)))
                         (flit--log-trace "handle-make-process: created stderr proc=%s" stderr-proc)
                         (process-put proc 'flit-stderr-proc stderr-proc)))))
                  (proc (flit--exec-start host name program program-args
