@@ -560,6 +560,11 @@ freely change current-buffer without corrupting the parse loop."
 PAYLOAD-DATA is the extracted payload string, or nil."
   (let ((msg-type (plist-get meta :t))
         (id (plist-get meta :id)))
+    ;; Chunked first frame: seed chunks table, don't dispatch yet
+    (when (plist-get meta :chunked)
+      (puthash id (cons meta (if payload-data (list payload-data) nil))
+               (flitrpc-conn-chunks conn))
+      (cl-return-from flitrpc--dispatch-frame))
     (pcase msg-type
       ;; Response
       ((pred (= flitrpc--type-response))

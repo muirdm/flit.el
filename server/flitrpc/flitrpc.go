@@ -148,7 +148,7 @@ const chunkSize = 256 * 1024 // 256KB chunks for multiplexing
 
 // writeChunked writes a message with a large payload as multiple frames,
 // releasing the mutex between chunks so other messages can interleave.
-func (fw *Writer) writeChunked(metaBuf []byte, payload []byte) error {
+func (fw *Writer) writeChunked(id int64, metaBuf []byte, payload []byte) error {
 	// First frame: metadata + first chunk of payload
 	first := payload
 	if len(first) > chunkSize {
@@ -165,7 +165,7 @@ func (fw *Writer) writeChunked(metaBuf []byte, payload []byte) error {
 		if len(chunk) > chunkSize {
 			chunk = payload[:chunkSize]
 		}
-		contMeta, _ := marshalMsgpack(map[string]any{"t": TypeChunkContinue})
+		contMeta, _ := marshalMsgpack(map[string]any{"t": TypeChunkContinue, "id": id})
 		if err := fw.writeRaw(contMeta, chunk); err != nil {
 			return err
 		}
@@ -173,7 +173,7 @@ func (fw *Writer) writeChunked(metaBuf []byte, payload []byte) error {
 	}
 
 	// End frame
-	endMeta, _ := marshalMsgpack(map[string]any{"t": TypeChunkEnd})
+	endMeta, _ := marshalMsgpack(map[string]any{"t": TypeChunkEnd, "id": id})
 	return fw.writeRaw(endMeta, nil)
 }
 
@@ -248,9 +248,13 @@ func (s *Server) Notify(method string, params any) error {
 
 // NotifyWithPayload sends a notification with optional binary payload.
 func (s *Server) NotifyWithPayload(method string, params any, payload []byte) error {
+	// Use a unique negative ID for chunked notifications so chunks
+	// can be reassembled.  Negative to avoid collision with client
+	// request IDs (which are positive).
+	id := -s.nextID.Add(1)
 	metaMap := map[string]any{
 		"t":      TypeNotification,
-		"id":     0,
+		"id":     id,
 		"method": method,
 		"params": params,
 	}
@@ -262,7 +266,7 @@ func (s *Server) NotifyWithPayload(method string, params any, payload []byte) er
 		return fmt.Errorf("flitrpc: encoding notification: %w", err)
 	}
 	if len(payload) > chunkSize {
-		return s.writer.writeChunked(metaBuf, payload)
+		return s.writer.writeChunked(id, metaBuf, payload)
 	}
 	return s.writer.writeRaw(metaBuf, payload)
 }
@@ -366,7 +370,7 @@ func (s *Server) sendResult(id int64, result any, payload []byte) {
 		return
 	}
 	if len(payload) > chunkSize {
-		if err := s.writer.writeChunked(metaBuf, payload); err != nil {
+		if err := s.writer.writeChunked(id, metaBuf, payload); err != nil {
 			s.logger.Error("flitrpc: failed to send chunked response", "id", id, "error", err)
 		}
 	} else {
