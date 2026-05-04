@@ -923,7 +923,54 @@ func (s *Server) registerHandlers(rpc *flitrpc.Server, sess *Session) {
 	simple("fs/copy", s.fsHandler.Copy)
 	simple("fs/exists", s.fsHandler.Exists)
 	simple("fs/realpath", s.fsHandler.Realpath)
-	simple("fs/batch", s.fsHandler.Batch)
+	// fs/batch: respond immediately, then send each file's info as a
+	// separate fs/entryInfo notification.  This avoids a single huge
+	// response that blocks the writer mutex and causes head-of-line
+	// blocking for other RPCs.
+	rpc.HandleFunc("fs/batch", func(raw msgpack.RawMessage) (any, error) {
+		s.touch()
+		var p struct {
+			Paths []string `json:"paths"`
+		}
+		if err := flitrpc.UnmarshalParams(raw, &p); err != nil {
+			return nil, err
+		}
+		slog.Info("fs/batch", "count", len(p.Paths))
+
+		// Collect paths + parent dirs
+		allPaths := make(map[string]bool)
+		for _, path := range p.Paths {
+			allPaths[path] = true
+			allPaths[filepath.Dir(path)] = true
+		}
+
+		// Fetch and notify each path asynchronously
+		go func() {
+			bwg := util.NewBoundedWaitGroup(32)
+			for path := range allPaths {
+				bwg.Add(1)
+				go func(p string) {
+					defer bwg.Done()
+					info, err := s.fsHandler.GetInfo(p)
+					if err != nil {
+						return
+					}
+					content := info.Content
+					info.Content = nil
+					cache := fs.BuildCacheEntries(info)
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					sess.notifyWithPayload(ctx, "fs/entryInfo", map[string]interface{}{
+						"path":  p,
+						"cache": cache,
+					}, content)
+				}(path)
+			}
+			bwg.Wait()
+		}()
+
+		return map[string]bool{"ok": true}, nil
+	})
 	simple("fs/chmod", s.fsHandler.Chmod)
 	simple("fs/touch", s.fsHandler.Touch)
 	simple("fs/copy-dir", s.fsHandler.CopyDir)
