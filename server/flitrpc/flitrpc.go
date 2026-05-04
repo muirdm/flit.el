@@ -15,6 +15,7 @@ package flitrpc
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -106,11 +107,24 @@ func NewWriter(w io.Writer) *Writer {
 
 // WriteFrame writes a single frame.
 func (fw *Writer) WriteFrame(meta Meta, payload []byte) error {
-	metaBuf, err := msgpack.Marshal(meta)
+	metaBuf, err := marshalMsgpack(meta)
 	if err != nil {
 		return fmt.Errorf("flitrpc: encoding meta: %w", err)
 	}
 	return fw.writeRaw(metaBuf, payload)
+}
+
+// marshalMsgpack encodes v using msgpack with json struct tag fallback.
+// This allows Go structs with json:"..." tags (but no msgpack tags) to
+// produce lowercase field names matching the JSON convention.
+func marshalMsgpack(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := msgpack.NewEncoder(&buf)
+	enc.SetCustomStructTag("json")
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 func (fw *Writer) writeRaw(metaBuf, payload []byte) error {
@@ -196,23 +210,19 @@ func (s *Server) Notify(method string, params any) error {
 
 // NotifyWithPayload sends a notification with optional binary payload.
 func (s *Server) NotifyWithPayload(method string, params any, payload []byte) error {
-	var paramsMap map[string]any
-	if params != nil {
-		// Convert params to map[string]any via JSON roundtrip
-		b, err := json.Marshal(params)
-		if err != nil {
-			return fmt.Errorf("flitrpc: marshaling notification params: %w", err)
-		}
-		if err := json.Unmarshal(b, &paramsMap); err != nil {
-			return fmt.Errorf("flitrpc: unmarshaling notification params: %w", err)
-		}
+	// Build a minimal meta map and encode the params directly via
+	// msgpack (not via JSON roundtrip which loses int/float distinction).
+	metaMap := map[string]any{
+		"t":      TypeNotification,
+		"id":     0,
+		"method": method,
+		"params": params,
 	}
-	meta := Meta{
-		Type:   TypeNotification,
-		Method: method,
-		Params: paramsMap,
+	metaBuf, err := marshalMsgpack(metaMap)
+	if err != nil {
+		return fmt.Errorf("flitrpc: encoding notification: %w", err)
 	}
-	return s.writer.WriteFrame(meta, payload)
+	return s.writer.writeRaw(metaBuf, payload)
 }
 
 // Callback sends a request to the client and waits for a response.
@@ -311,26 +321,36 @@ func (s *Server) handleWithFallback(frame *Frame) {
 }
 
 func (s *Server) sendResult(id int64, result any, payload []byte) {
-	meta := Meta{
-		Type:   TypeResponse,
-		ID:     id,
-		Result: result,
+	metaMap := map[string]any{
+		"t":      TypeResponse,
+		"id":     id,
+		"result": result,
 	}
-	if err := s.writer.WriteFrame(meta, payload); err != nil {
+	metaBuf, err := marshalMsgpack(metaMap)
+	if err != nil {
+		s.logger.Error("flitrpc: failed to encode response", "id", id, "error", err)
+		return
+	}
+	if err := s.writer.writeRaw(metaBuf, payload); err != nil {
 		s.logger.Error("flitrpc: failed to send response", "id", id, "error", err)
 	}
 }
 
 func (s *Server) sendError(id int64, code int, message string) {
-	meta := Meta{
-		Type: TypeResponse,
-		ID:   id,
-		Error: &ErrorInfo{
-			Code:    code,
-			Message: message,
+	metaMap := map[string]any{
+		"t":  TypeResponse,
+		"id": id,
+		"error": map[string]any{
+			"code":    code,
+			"message": message,
 		},
 	}
-	if err := s.writer.WriteFrame(meta, nil); err != nil {
+	metaBuf, err := marshalMsgpack(metaMap)
+	if err != nil {
+		s.logger.Error("flitrpc: failed to encode error", "id", id, "error", err)
+		return
+	}
+	if err := s.writer.writeRaw(metaBuf, nil); err != nil {
 		s.logger.Error("flitrpc: failed to send error", "id", id, "error", err)
 	}
 }
@@ -364,19 +384,17 @@ func (s *Server) SendRequest(method string, params any) (any, error) {
 		callbackMu.Unlock()
 	}()
 
-	var paramsMap map[string]any
-	if params != nil {
-		b, _ := json.Marshal(params)
-		json.Unmarshal(b, &paramsMap)
+	metaMap := map[string]any{
+		"t":      TypeRequest,
+		"id":     id,
+		"method": method,
+		"params": params,
 	}
-
-	meta := Meta{
-		Type:   TypeRequest,
-		ID:     id,
-		Method: method,
-		Params: paramsMap,
+	metaBuf, err := marshalMsgpack(metaMap)
+	if err != nil {
+		return nil, err
 	}
-	if err := s.writer.WriteFrame(meta, nil); err != nil {
+	if err := s.writer.writeRaw(metaBuf, nil); err != nil {
 		return nil, err
 	}
 

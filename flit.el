@@ -26,7 +26,7 @@
 
 (require 'cl-lib)
 (require 'json)
-(require 'jsonrpc)
+(require 'flitrpc)
 (require 'eieio)
 
 ;; Forward declarations for variables defined later in the file.
@@ -1078,19 +1078,8 @@ process receives output, or until timeout expires."
           ;; No connection available - fall through to default
           (funcall orig-fn process timeout timeout-msecs just-this-one)))
     ;; Not a flit process - use default, then process pending timers.
-    ;; jsonrpc-request's wait loop uses accept-process-output which
-    ;; doesn't fire timers.  This deadlocks when requests nest (e.g.
-    ;; notification handler triggers a sync RPC while an outer
-    ;; jsonrpc-request is waiting) because jsonrpc.el's bug#67945 fix
-    ;; defers response callbacks via run-at-time.  Calling sit-for
-    ;; after accept-process-output ensures those timers fire.
-    ;; We pass no :timeout to jsonrpc-request (so there's no timeout
-    ;; timer for sit-for to fire) and check our own deadline instead.
-    (prog1 (funcall orig-fn process timeout timeout-msecs just-this-one)
-      (sit-for 0 t)
-      (when (and flit--request-deadline
-                 (> (float-time) flit--request-deadline))
-        (signal 'flit-request-timeout nil)))))
+    ;; Not a flit process - use default
+    (funcall orig-fn process timeout timeout-msecs just-this-one)))
 
 (advice-add 'accept-process-output :around #'flit--accept-process-output-advice)
 
@@ -1230,19 +1219,21 @@ Port is included in HOST as host:port when present."
       (concat flit--prefix host)
     (concat flit--prefix host path)))
 
-;;; Connection management (using jsonrpc.el)
+;;; Connection management
 
-(defclass flit-connection (jsonrpc-process-connection)
-  ((host :initarg :host :accessor flit-connection-host))
-  "A JSON-RPC connection to a flit server.")
+(cl-defstruct flit-connection
+  "A flitrpc connection to a flit server."
+  host      ; hostname string
+  rpc)      ; flitrpc-conn struct
 
 (defun flit-conn-process (conn)
   "Return the underlying Emacs process for CONN."
-  (jsonrpc--process conn))
+  (flitrpc-conn-process (flit-connection-rpc conn)))
 
 (defun flit-conn-running-p (conn)
   "Return non-nil if CONN is running."
-  (jsonrpc-running-p conn))
+  (when-let ((proc (flit-conn-process conn)))
+    (process-live-p proc)))
 
 (defun flit--await (async-fn)
   "Drive ASYNC-FN synchronously, waiting for its callback.
@@ -1261,12 +1252,6 @@ Returns RESULT on success, signals error on failure."
     (if error-msg
         (error "%s" error-msg)
       result)))
-
-(defun flit--events-buffer-config ()
-  "Return the events buffer config based on `flit-log-events'."
-  (if flit-log-events
-      '(:size nil :format full)  ; nil means unlimited
-    '(:size 0)))                 ; 0 means disabled
 
 (defun flit--get-connection-method (host)
   "Get connection method for HOST from `flit-connection-methods'.
@@ -1478,21 +1463,36 @@ Defaults to `passive' when `flit--connection-tier' is unbound.
 
 (defun flit--make-connection (host proc)
   "Create a flit-connection for HOST using PROC."
-  (let ((conn (make-instance
-               'flit-connection
-               :name (process-name proc)
-               :process proc
-               :host host
-               :events-buffer-config (flit--events-buffer-config)
-               :notification-dispatcher #'flit--handle-notification
-               :request-dispatcher #'flit--handle-request
-               :on-shutdown (flit--on-shutdown host))))
-    ;; Increase read chunk size so Emacs drains the pipe faster, reducing
-    ;; backpressure on large responses/notifications (default is often 4KB).
-    (when-let ((buf (process-buffer proc)))
-      (with-current-buffer buf
-        (setq-local read-process-output-max (* 1024 1024))))
-    conn))
+  ;; Save any leftover data from the handshake filter (flitrpc frames
+  ;; that arrived in the same chunk as the ready message).
+  (let ((leftover (process-get proc 'flit-sm-pending)))
+    (let* ((conn (make-flit-connection :host host))
+           (rpc (flitrpc-make-conn
+                 proc host
+                 :notification-fn
+                 (lambda (rpc-conn method params _ps _pe)
+                   (ignore rpc-conn)
+                   (flit--handle-notification conn (intern method) params))
+                 :request-fn
+                 (lambda (rpc-conn method _params)
+                   (ignore rpc-conn)
+                   (flit--handle-request conn (intern method) nil))
+                 :on-shutdown
+                 (lambda (_rpc-conn)
+                   (funcall (flit--on-shutdown host) conn)))))
+      (setf (flit-connection-rpc conn) rpc)
+      (set-process-query-on-exit-flag proc nil)
+      ;; Increase read chunk size for better throughput
+      (when (process-buffer proc)
+        (with-current-buffer (process-buffer proc)
+          (setq-local read-process-output-max (* 1024 1024))))
+      ;; Inject leftover handshake data into the flitrpc buffer
+      (when (and leftover (> (length leftover) 0))
+        (with-current-buffer (flitrpc-conn-buffer rpc)
+          (goto-char (point-max))
+          (insert leftover))
+        (flitrpc--parse-frames rpc))
+      conn)))
 
 ;;; Connection type: :stdio
 
@@ -1936,6 +1936,12 @@ For use with :et connections or manual :pty-bridge with deploy."
                          :handle-password t
                          :deploy-handler #'flit--in-band-deploy-handler))
 
+(defun flit--stdio-ready-handshake (host proc callback)
+  "Wait for flit_ready on PROC, then call CALLBACK.
+Used for :stdio connections without an explicit handshake."
+  (flit--setup-handshake host proc callback
+                         :handle-password nil))
+
 ;;; SSH fast path
 
 (defun flit--ssh-fast-handshake (host proc callback method-chain ssh-args)
@@ -2083,7 +2089,8 @@ METHOD-CHAIN accumulates the method resolution path for display."
      ;; (:stdio COMMAND [:handshake FN])
      ((and (consp method) (eq (car method) :stdio))
       (let ((command (nth 1 method))
-            (handshake-fn (plist-get (cddr method) :handshake))
+            (handshake-fn (or (plist-get (cddr method) :handshake)
+                              #'flit--stdio-ready-handshake))
             (chain (cons "stdio" method-chain)))
         (flit--create-stdio-connection host command (wrap-callback handshake-fn chain))))
 
@@ -2251,43 +2258,41 @@ Marks them as exited, calls their sentinels, and deletes them."
 CALLBACK is called with (SUCCESS ERROR-MSG) when done.
 Fetches sys/info and PATH dirs, caches results."
   (flit--log-info "Async initializing connection to %s" host)
-  (jsonrpc-async-request
-   conn "init" nil
-   :success-fn
-   (lambda (result)
-     (flit--log-info "Async RPC init success for %s" host)
-     ;; Cache sys-info (everything except pathDirs)
-     (let ((sys-info (list :os (plist-get result :os)
-                           :arch (plist-get result :arch)
-                           :homeDir (plist-get result :homeDir)
-                           :hostname (plist-get result :hostname)
-                           :username (plist-get result :username)
-                           :path (plist-get result :path)
-                           :pid (plist-get result :pid))))
-       (puthash host sys-info flit--sys-info))
-     ;; Cache PATH directory listings
-     (let ((path-dirs (plist-get result :pathDirs)))
-       (seq-doseq (dir-entry path-dirs)
-         (let ((path (plist-get dir-entry :path))
-               (children (plist-get dir-entry :children))
-               (error-msg (plist-get dir-entry :error)))
-           (unless error-msg
-             (let ((info (list :exists t
-                               :type "directory"
-                               :isDir t
-                               :path path
-                               :children children)))
-               (flit--log-debug "PATH prefetch: caching %s with %d children"
-                                path (if children (length children) 0))
-               (flit--cache-put host path info)))))
-       (flit--log-info "Cached %d PATH directories for %s"
-                       (length path-dirs) host))
-     (funcall callback t nil))
-   :error-fn
+  (flitrpc-request
+   (flit-connection-rpc conn) "init" nil
+   (lambda (meta _ps _pe)
+     (let ((result (plist-get meta :result)))
+       (flit--log-info "Async RPC init success for %s" host)
+       ;; Cache sys-info (everything except pathDirs)
+       (let ((sys-info (list :os (plist-get result :os)
+                             :arch (plist-get result :arch)
+                             :homeDir (plist-get result :homeDir)
+                             :hostname (plist-get result :hostname)
+                             :username (plist-get result :username)
+                             :path (plist-get result :path)
+                             :pid (plist-get result :pid))))
+         (puthash host sys-info flit--sys-info))
+       ;; Cache PATH directory listings
+       (let ((path-dirs (plist-get result :pathDirs)))
+         (seq-doseq (dir-entry path-dirs)
+           (let ((path (plist-get dir-entry :path))
+                 (children (plist-get dir-entry :children))
+                 (error-msg (plist-get dir-entry :error)))
+             (unless error-msg
+               (let ((info (list :exists t
+                                 :type "directory"
+                                 :isDir t
+                                 :path path
+                                 :children children)))
+                 (flit--log-debug "PATH prefetch: caching %s with %d children"
+                                  path (if children (length children) 0))
+                 (flit--cache-put host path info)))))
+         (flit--log-info "Cached %d PATH directories for %s"
+                         (length path-dirs) host))
+       (funcall callback t nil)))
    (lambda (err)
      (flit--log "Async init failed for %s: %s" host err)
-     (funcall callback nil (format "Init failed: %s" err)))
-   :timeout 30))
+     (funcall callback nil (format "Init failed: %s" err)))))
 
 (defun flit--get-sys-info (host)
   "Get cached sys-info for HOST, or nil if not available."
@@ -2573,79 +2578,38 @@ PARAMS contains :procId and :exitCode."
                exists type size has-content num-children num-cached)))
     (_ "")))
 
-(defun flit--check-jsonrpc-buffer (conn)
-  "Check if the jsonrpc process buffer has unparsable data stuck at point.
-If so, log the stuck data to help diagnose hangs."
-  (when-let* ((proc (flit-conn-process conn))
-              (buf (process-buffer proc)))
-    (when (buffer-live-p buf)
-      (with-current-buffer buf
-        (let ((unprocessed (- (position-bytes (process-mark proc))
-                              (position-bytes (point))))
-              (expected (and (fboundp 'jsonrpc--expected-bytes)
-                            (jsonrpc--expected-bytes conn))))
-          (when (> unprocessed 0)
-            (let ((head (buffer-substring-no-properties
-                         (point) (min (+ (point) 200) (point-max)))))
-              (if expected
-                  (flit--log-info
-                   "jsonrpc buffer: waiting for %d more bytes (%d available), data at point:\n  %s"
-                   expected unprocessed (string-replace "\n" "\n  " head))
-                (unless (string-match-p "^Content-Length:" head)
-                  (flit--log-error
-                   "jsonrpc buffer stuck: %d unprocessed bytes, no Content-Length header at point:\n  %s"
-                   unprocessed (string-replace "\n" "\n  " head)))))))))))
-
-(defvar flit--request-deadline nil
-  "Deadline for the current `flit--send-request' call, or nil.
-Used by `flit--accept-process-output-advice' to implement timeouts
-without Emacs timers.  We avoid timer-based timeouts because our
-advice calls `sit-for' (to fire jsonrpc.el's bug#67945 anxious
-continuation callbacks), and `sit-for' would also fire the timeout
-timer, aborting large responses mid-transfer.")
-
-(define-error 'flit-request-timeout "Flit request timed out")
-
 (defun flit--send-request (host method params &optional timeout)
-  "Send a JSON-RPC request to HOST and wait for response.
+  "Send RPC request to HOST and wait for response.
 METHOD is the RPC method name, PARAMS is a plist of parameters.
 TIMEOUT is optional seconds to wait (default `flit-timeout').
-Returns the result or signals an error."
+Returns the result plist or signals an error."
   (let ((conn (flit--get-connection host)))
     (unless conn
       (error "Cannot connect to flit-server on %s" host))
-    (let* ((start-time (float-time))
-           (flit--request-deadline (+ (float-time) (or timeout flit-timeout))))
+    (let ((start-time (float-time)))
       (condition-case err
-          (let ((result (jsonrpc-request conn method params :timeout nil)))
+          (let ((result (flitrpc-request-sync
+                         (flit-connection-rpc conn) method params
+                         (or timeout flit-timeout))))
             (flit--log-info "RPC %s %S -> %.3fs%s"
                             method (flit--sanitize-params-for-log params)
                             (- (float-time) start-time)
                             (flit--format-rpc-result-extra method result))
-            result)
-        (flit-request-timeout
-         (flit--log-error "RPC %s %S -> ERROR after %.3fs: %S"
-                          method (flit--sanitize-params-for-log params)
-                          (- (float-time) start-time) '((jsonrpc-error-message . "Timed out")))
-         (flit--check-jsonrpc-buffer conn)
-         (signal 'jsonrpc-error
-                 (cons (format "request for %s timed out" method)
-                       '((jsonrpc-error-message . "Timed out")))))
-        (jsonrpc-error
+            ;; flitrpc wraps result in (:t 2 :id N :result RESULT) — extract it
+            (plist-get result :result))
+        (flitrpc-error
          (flit--log-error "RPC %s %S -> ERROR after %.3fs: %S"
                           method (flit--sanitize-params-for-log params)
                           (- (float-time) start-time) err)
-         (flit--check-jsonrpc-buffer conn)
-         (signal (car err) (cdr err)))
+         (signal 'flitrpc-error (cdr err)))
         (quit
          (flit--log-info "C-g interrupted RPC %s on %s after %.3fs\n  backtrace: %s"
                           method host (- (float-time) start-time)
                           (flit--simple-backtrace))
-         (flit--check-jsonrpc-buffer conn)
          (signal 'quit nil))))))
 
 (defun flit--send-request-async (host method params &optional success-fn error-fn)
-  "Send a JSON-RPC request to HOST asynchronously.
+  "Send an async RPC request to HOST.
 METHOD is the RPC method name, PARAMS is a plist of parameters.
 SUCCESS-FN is called with the result on success.
 ERROR-FN is called with the error on failure."
@@ -2653,17 +2617,17 @@ ERROR-FN is called with the error on failure."
     (unless conn
       (error "Cannot connect to flit-server on %s" host))
     (flit--log-info "RPC async %s %S" method (flit--sanitize-params-for-log params))
-    ;; Note: no timeout - fire and forget for async requests
-    (jsonrpc-async-request conn method params
-                           :success-fn (or success-fn #'ignore)
-                           :error-fn (or error-fn #'ignore))))
+    (flitrpc-request (flit-connection-rpc conn) method params
+                     (lambda (meta _ps _pe)
+                       (funcall (or success-fn #'ignore) (plist-get meta :result)))
+                     (or error-fn #'ignore))))
 
 (defun flit--send-notify (host method params)
-  "Send a JSON-RPC notification to HOST (fire-and-forget).
+  "Send notification to HOST (fire-and-forget).
 METHOD is the RPC method name, PARAMS is a plist of parameters."
   (let ((conn (flit--get-connection host)))
     (when conn
-      (jsonrpc-notify conn method params))))
+      (flitrpc-notify (flit-connection-rpc conn) method params))))
 
 ;;; File operations
 

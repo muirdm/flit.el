@@ -656,11 +656,11 @@ Must be called with the target buffer current."
               (when proc (delete-process proc))
               t)
           (kill-buffer buf)))
-    (jsonrpc-error
-     (if (string-match-p "operation not permitted"
-                         (or (cdr (assq 'jsonrpc-error-message (cdr err))) ""))
-         nil
-       (signal (car err) (cdr err))))))
+    (flitrpc-error
+     (let ((msg (or (plist-get (cadr err) :message) "")))
+       (if (string-match-p "operation not permitted" msg)
+           nil
+         (signal (car err) (cdr err)))))))
 
 (ert-deftest flit-test-pty-create ()
   "Test creating a process with PTY."

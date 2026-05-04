@@ -371,11 +371,16 @@ Return (VALUE . NEW-POS).  Operates on unibyte buffer."
       (flitrpc--write-value (aref vec i) emit))))
 
 (defun flitrpc--write-plist (plist emit)
-  "Serialize PLIST as msgpack map.  Keys are keywords (stripped of colon)."
+  "Serialize PLIST as msgpack map.  Keyword keys have colon stripped."
   (let* ((pairs nil)
          (pl plist))
     (while pl
-      (push (cons (substring (symbol-name (car pl)) 1) (cadr pl)) pairs)
+      (let* ((key (car pl))
+             (key-name (symbol-name key))
+             (key-str (if (eq (aref key-name 0) ?:)
+                          (substring key-name 1)
+                        key-name)))
+        (push (cons key-str (cadr pl)) pairs))
       (setq pl (cddr pl)))
     (setq pairs (nreverse pairs))
     (let ((len (length pairs)))
