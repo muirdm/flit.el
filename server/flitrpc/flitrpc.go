@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -312,6 +313,7 @@ func (s *Server) Stop() {
 func (s *Server) handleRequest(frame *Frame) {
 	method := frame.Meta.Method
 	id := frame.Meta.ID
+	start := time.Now()
 
 	handler, ok := s.handlers[method]
 	if !ok {
@@ -324,6 +326,10 @@ func (s *Server) handleRequest(frame *Frame) {
 	}
 
 	result, resultPayload, err := handler(frame.Meta.Params, frame.Payload)
+	elapsed := time.Since(start)
+	if elapsed > 100*time.Millisecond {
+		s.logger.Info("slow request", "method", method, "id", id, "elapsed", elapsed)
+	}
 	if err != nil {
 		s.sendError(id, -32603, err.Error())
 		return

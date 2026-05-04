@@ -472,7 +472,8 @@ PAYLOAD is an optional unibyte string of raw bytes."
   request-fn      ; function called for server->client requests: (fn method params) -> result
   chunks          ; hash table: id -> (meta . payload-parts) for chunked reassembly
   on-shutdown     ; function called when connection closes
-  sync-done)      ; set to t when a sync request completes, to interrupt parsing
+  sync-done       ; set to t when a sync request completes, to interrupt parsing
+  parsing)        ; t while flitrpc--parse-frames is running (prevents re-entrancy)
 
 (defun flitrpc-make-conn (process host &rest args)
   "Create a flitrpc connection over PROCESS for HOST.
@@ -503,8 +504,17 @@ ARGS are keyword args: :notification-fn, :request-fn, :on-shutdown."
       (when (buffer-live-p buf)
         (with-current-buffer buf
           (goto-char (point-max))
-          (insert data)
-          (flitrpc--parse-frames conn))))))
+          (insert data))
+        ;; Only parse if not already parsing.  Re-entrant filter calls
+        ;; happen when a dispatch callback triggers accept-process-output
+        ;; (e.g., sync RPC from a notification handler).  In that case,
+        ;; just buffer the data — the outer parse loop will process it.
+        (unless (flitrpc-conn-parsing conn)
+          (setf (flitrpc-conn-parsing conn) t)
+          (unwind-protect
+              (with-current-buffer buf
+                (flitrpc--parse-frames conn))
+            (setf (flitrpc-conn-parsing conn) nil)))))))
 
 (defun flitrpc--make-sentinel (conn)
   "Return a process sentinel function for CONN."
@@ -557,6 +567,7 @@ ARGS are keyword args: :notification-fn, :request-fn, :on-shutdown."
     (pcase msg-type
       ;; Response
       ((pred (= flitrpc--type-response))
+       (message "flitrpc: received response id=%d" id)
        (let ((err (plist-get meta :error)))
          (if err
              (flitrpc--complete-request conn id nil err)
@@ -591,11 +602,15 @@ ARGS are keyword args: :notification-fn, :request-fn, :on-shutdown."
 
 (defun flitrpc--complete-request (conn id meta err &optional payload-start payload-end)
   "Complete pending request ID on CONN with META/ERR."
-  (when-let ((entry (gethash id (flitrpc-conn-pending conn))))
-    (remhash id (flitrpc-conn-pending conn))
-    (if err
-        (funcall (cdr entry) err)
-      (funcall (car entry) meta payload-start payload-end))))
+  (let ((entry (gethash id (flitrpc-conn-pending conn))))
+    (unless entry
+      (message "flitrpc: response for unknown id %d (pending: %S)" id
+               (hash-table-keys (flitrpc-conn-pending conn))))
+    (when entry
+      (remhash id (flitrpc-conn-pending conn))
+      (if err
+          (funcall (cdr entry) err)
+        (funcall (car entry) meta payload-start payload-end)))))
 
 ;; Chunked message reassembly
 
@@ -654,6 +669,7 @@ ERROR-FN is called with (error-plist)."
   (let ((id (cl-incf (flitrpc-conn-next-id conn))))
     (puthash id (cons success-fn (or error-fn #'ignore))
              (flitrpc-conn-pending conn))
+    (message "flitrpc: sending request id=%d method=%s" id method)
     (flitrpc--write-frame conn
                           flitrpc--type-request id
                           (list :method method :params params))
