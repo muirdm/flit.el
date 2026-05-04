@@ -2485,25 +2485,7 @@ attached to the first cache entry."
                   ;; Buffer is unmodified - safe to mark for revert
                   (setq-local flit--file-changed t)
                   (flit--log-info "watcher: %s marking stale, visited-modtime=%s file-mtime=%s"
-                                  (buffer-name) (float-time (visited-file-modtime)) new-mtime)
-                  ;; If auto-revert-mode is enabled, trigger an immediate revert.
-                  ;; We call revert-buffer directly rather than auto-revert-handler
-                  ;; because auto-revert-handler has a sit-for that creates a race
-                  ;; window where user input during the sit-for could trigger a
-                  ;; revert even though buffer-modified-p was checked before sit-for.
-                  ;; Preserve mark ring to avoid polluting navigation history.
-                  (when (or (and (boundp 'auto-revert-mode) auto-revert-mode)
-                            (and (boundp 'global-auto-revert-mode) global-auto-revert-mode))
-                    (let ((saved-mark-ring mark-ring)
-                          (saved-mark (mark-marker)))
-                      (unless (buffer-modified-p)
-                        (flit--log-info "watcher: %s REVERTING (auto-revert-mode=t)"
-                                        (buffer-name))
-                        (revert-buffer 'ignore-auto 'dont-ask 'preserve-modes)
-                        (setq flit--file-changed nil))
-                      (setq mark-ring saved-mark-ring)
-                      (when (marker-position saved-mark)
-                        (set-marker (mark-marker) (marker-position saved-mark))))))))))))))
+                                  (buffer-name) (float-time (visited-file-modtime)) new-mtime))))))))))
 
 (defun flit--handle-exec-output (params)
   "Handle exec/output notification with PARAMS.
