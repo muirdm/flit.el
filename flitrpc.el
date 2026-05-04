@@ -633,20 +633,11 @@ PAYLOAD-DATA is the extracted payload string, or nil."
 
 ;;; Public API
 
-(defun flitrpc-request (conn method params success-fn &optional error-fn)
+(defun flitrpc-request (conn method params success-fn &optional error-fn payload)
   "Send async request to CONN.  Return msg-id.
 SUCCESS-FN is called with (meta payload-data).
-ERROR-FN is called with (error-plist)."
-  (let ((id (cl-incf (flitrpc-conn-next-id conn))))
-    (puthash id (cons success-fn (or error-fn #'ignore))
-             (flitrpc-conn-pending conn))
-    (flitrpc--write-frame conn
-                          flitrpc--type-request id
-                          (list :method method :params params))
-    id))
-
-(defun flitrpc-request-with-payload (conn method params payload success-fn &optional error-fn)
-  "Like `flitrpc-request' but include raw PAYLOAD bytes."
+ERROR-FN is called with (error-plist).
+PAYLOAD is optional raw bytes sent as the frame payload."
   (let ((id (cl-incf (flitrpc-conn-next-id conn))))
     (puthash id (cons success-fn (or error-fn #'ignore))
              (flitrpc-conn-pending conn))
@@ -663,11 +654,11 @@ ERROR-FN is called with (error-plist)."
                         (list :method method :params params)
                         payload))
 
-(defun flitrpc-request-sync (conn method params &optional timeout)
+(defun flitrpc-request-sync (conn method params &optional timeout payload)
   "Send request to CONN and wait for response.
-TIMEOUT defaults to 5 seconds.  Returns the result meta plist.
-If the response has a payload, it is extracted from the process buffer
-and attached as :payload on the result.
+TIMEOUT defaults to 5 seconds.  PAYLOAD is optional raw bytes.
+Returns the result meta plist.  If the response has a payload, it is
+attached as :payload on the result.
 Nested calls work: each has its own done/result variables."
   (let ((done nil)
         (result nil)
@@ -683,7 +674,8 @@ Nested calls work: each has its own done/result variables."
                        (setq result meta done t))
                      (lambda (e)
                        (setf (flitrpc-conn-sync-done conn) t)
-                       (setq err e done t)))
+                       (setq err e done t))
+                     payload)
     (while (not done)
       (when (> (float-time) deadline)
         (setq err '(:message "Timed out") done t))

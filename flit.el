@@ -991,16 +991,13 @@ hash lookup instead of flit--get-connection to avoid side effects."
   "Send STRING to flit process PROC via exec/input, or call ORIG-FN."
   (if-let* ((proc-id (flit--process-valid-for-rpc-p proc "send"))
             (host (process-get proc 'flit-host)))
-      (let (;; Ensure multibyte string for msgpack encoding.
-            ;; LSP messages containing non-ASCII may be unibyte if
-            ;; lsp-mode encoded them for the wire.
-            (data (if (multibyte-string-p string)
-                      string
-                    (decode-coding-string string 'utf-8-unix))))
+      (let ((data (if (multibyte-string-p string)
+                      (encode-coding-string string 'utf-8-unix)
+                    string)))
         (flit--log-debug "process-send-string: proc-id=%s len=%d"
-                         proc-id (length string))
+                         proc-id (length data))
         (flit--send-notify host "exec/input"
-                           `(:procId ,proc-id :data ,data)))
+                           `(:procId ,proc-id) data))
     (funcall orig-fn proc string)))
 
 (advice-add 'process-send-string :around #'flit--process-send-string-advice)
@@ -2593,10 +2590,11 @@ PARAMS contains :procId and :exitCode."
                exists type size has-content num-children num-cached)))
     (_ "")))
 
-(defun flit--send-request (host method params &optional timeout)
+(defun flit--send-request (host method params &optional timeout payload)
   "Send RPC request to HOST and wait for response.
 METHOD is the RPC method name, PARAMS is a plist of parameters.
 TIMEOUT is optional seconds to wait (default `flit-timeout').
+PAYLOAD is optional raw bytes sent as the frame payload.
 Returns the result plist or signals an error."
   (let ((conn (flit--get-connection host)))
     (unless conn
@@ -2605,7 +2603,7 @@ Returns the result plist or signals an error."
       (condition-case err
           (let ((result (flitrpc-request-sync
                          (flit-connection-rpc conn) method params
-                         (or timeout flit-timeout))))
+                         (or timeout flit-timeout) payload)))
             (flit--log-info "RPC %s %S -> %.3fs%s"
                             method (flit--sanitize-params-for-log params)
                             (- (float-time) start-time)
@@ -2641,12 +2639,13 @@ ERROR-FN is called with the error on failure."
                        (funcall (or success-fn #'ignore) (plist-get meta :result)))
                      (or error-fn #'ignore))))
 
-(defun flit--send-notify (host method params)
+(defun flit--send-notify (host method params &optional payload)
   "Send notification to HOST (fire-and-forget).
-METHOD is the RPC method name, PARAMS is a plist of parameters."
+METHOD is the RPC method name, PARAMS is a plist of parameters.
+PAYLOAD is optional raw bytes sent as the frame payload."
   (let ((conn (flit--get-connection host)))
     (when conn
-      (flitrpc-notify (flit-connection-rpc conn) method params))))
+      (flitrpc-notify (flit-connection-rpc conn) method params payload))))
 
 ;;; File operations
 
@@ -2746,7 +2745,7 @@ overwriting."
                            (if (listp expected-mtime)
                                (float-time expected-mtime)
                              expected-mtime)))
-           (params `(:path ,path :content (:bin . ,raw-bytes)))
+           (params `(:path ,path))
            result)
       ;; Add expectedMtime if we have an expectation
       (when expect-mtime
@@ -2754,7 +2753,7 @@ overwriting."
       ;; If no expected mtime (new file), tell server we expect file to not exist
       (unless expect-mtime
         (setq params (plist-put params :expectNotExist t)))
-      (setq result (flit--send-request host "fs/write" params))
+      (setq result (flit--send-request host "fs/write" params nil raw-bytes))
       ;; Handle mismatch response
       (when (eq (plist-get result :mismatch) t)
         (flit--log-info "Write mismatch for %s - file changed on disk" path)
@@ -5326,7 +5325,7 @@ A new client has connected to a remote tunnel listener."
 (defun flit--tunnel-send-data (host conn-id data)
   "Send DATA from local connection CONN-ID to the remote via HOST."
   (flit--send-notify host "tunnel/data"
-                     `(:connId ,conn-id :data (:bin . ,data))))
+                     `(:connId ,conn-id) data))
 
 (defun flit--tunnel-local-disconnected (tunnel-id conn-id)
   "Handle local connection CONN-ID in tunnel TUNNEL-ID being closed."
