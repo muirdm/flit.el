@@ -182,11 +182,11 @@ func NewSession(logLevel slog.Level) *Session {
 	// Initialize process manager - callbacks check for nil notify
 	sess.procManager = exec.NewManager(
 		// onOutput callback
-		func(procID string, stream string, data string) {
+		func(procID string, stream string, data []byte) {
 			if sess.notify != nil {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
-				if err := sess.notify(ctx, "exec/output", map[string]string{
+				if err := sess.notify(ctx, "exec/output", map[string]any{
 					"procId": procID,
 					"stream": stream,
 					"data":   data,

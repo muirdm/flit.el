@@ -27,10 +27,8 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 )
 
-var magic = [4]byte{'F', 'L', 'T', 'R'}
-
 const (
-	headerSize = 12
+	headerSize = 8 // meta_len(4) + payload_len(4)
 
 	TypeRequest       = 1
 	TypeResponse      = 2
@@ -67,11 +65,8 @@ func ReadFrame(r *bufio.Reader) (*Frame, error) {
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, err
 	}
-	if hdr[0] != magic[0] || hdr[1] != magic[1] || hdr[2] != magic[2] || hdr[3] != magic[3] {
-		return nil, fmt.Errorf("flitrpc: bad magic %x%x%x%x", hdr[0], hdr[1], hdr[2], hdr[3])
-	}
-	metaLen := binary.BigEndian.Uint32(hdr[4:8])
-	payloadLen := binary.BigEndian.Uint32(hdr[8:12])
+	metaLen := binary.BigEndian.Uint32(hdr[0:4])
+	payloadLen := binary.BigEndian.Uint32(hdr[4:8])
 
 	metaBuf := make([]byte, metaLen)
 	if _, err := io.ReadFull(r, metaBuf); err != nil {
@@ -129,9 +124,8 @@ func marshalMsgpack(v any) ([]byte, error) {
 
 func (fw *Writer) writeRaw(metaBuf, payload []byte) error {
 	var hdr [headerSize]byte
-	copy(hdr[:4], magic[:])
-	binary.BigEndian.PutUint32(hdr[4:8], uint32(len(metaBuf)))
-	binary.BigEndian.PutUint32(hdr[8:12], uint32(len(payload)))
+	binary.BigEndian.PutUint32(hdr[0:4], uint32(len(metaBuf)))
+	binary.BigEndian.PutUint32(hdr[4:8], uint32(len(payload)))
 
 	fw.mu.Lock()
 	defer fw.mu.Unlock()

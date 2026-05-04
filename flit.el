@@ -741,12 +741,7 @@ Decodes base64 content on cache so it's ready for use."
       (unless (and existing
                    (plist-get existing :children)
                    (not (plist-get info :children)))
-        ;; Decode base64 content on cache (so we don't decode on every read)
-        ;; Content from server is always base64 encoded
-        (when-let ((content (plist-get info :content)))
-          (when (stringp content)
-            (setq info (plist-put (copy-sequence info) :content
-                                  (base64-decode-string content)))))
+        ;; Content arrives as raw bytes from msgpack — no decoding needed
         (when (flit--log-level-p 'trace)
           (flit--log-trace "Cache PUT %s (stat=%s children=%s content=%s realpath=%s)"
                            normalized
@@ -2413,7 +2408,7 @@ Caches entry info pushed by server async after fs/info on directories."
       (flit--cache-invalidate host path))
     ;; Find buffers visiting this file and mark them for revert
     (let* ((new-mtime (plist-get info :mtime))
-           (new-content-encoded (plist-get info :content)))
+           (new-content-raw (plist-get info :content)))
       (dolist (buf (buffer-list))
         (with-current-buffer buf
           (when (and buffer-file-name
@@ -2426,25 +2421,23 @@ Caches entry info pushed by server async after fs/info on directories."
                    (buffer-content (save-restriction
                                      (widen)
                                      (buffer-substring-no-properties (point-min) (point-max))))
-                   (new-content (and new-content-encoded
+                   (new-content (and new-content-raw
                                      (condition-case nil
-                                         (let* ((raw-bytes (base64-decode-string new-content-encoded))
-                                                ;; Use buffer's coding system to decode, like insert-file-contents does
-                                                (coding (or buffer-file-coding-system 'utf-8-unix)))
-                                           (decode-coding-string raw-bytes coding))
+                                         (let ((coding (or buffer-file-coding-system 'utf-8-unix)))
+                                           (decode-coding-string new-content-raw coding))
                                        (error nil))))
                    (content-unchanged (and new-content
                                            (string= new-content buffer-content)))
                    ;; Buffer is in sync if content matches OR (no content provided AND mtime matches)
                    (already-in-sync (or content-unchanged
-                                        (and (null new-content-encoded) mtime-matches))))
+                                        (and (null new-content-raw) mtime-matches))))
               ;; Debug: log content comparison details when content is provided but doesn't match
-              (when (and new-content-encoded (not content-unchanged))
-                (flit--log-info "watcher: %s content-mismatch: new-content-len=%s buffer-len=%s new-content-encoded-len=%s"
+              (when (and new-content-raw (not content-unchanged))
+                (flit--log-info "watcher: %s content-mismatch: new-content-len=%s buffer-len=%s new-content-raw-len=%s"
                                 (buffer-name)
                                 (if new-content (length new-content) "nil")
                                 (length buffer-content)
-                                (length new-content-encoded)))
+                                (length new-content-raw)))
               (if already-in-sync
                   ;; Buffer is already in sync - skip revert
                   ;; Update modtime so Emacs knows file is in sync
@@ -2454,7 +2447,7 @@ Caches entry info pushed by server async after fs/info on directories."
                         (set-visited-file-modtime (seconds-to-time new-mtime))))
                     (flit--log-info "watcher: %s already-in-sync (content=%s mtime-matches=%s), updated visited-modtime to %s"
                                     (buffer-name)
-                                    (if new-content-encoded "matched" "not-provided")
+                                    (if new-content-raw "matched" "not-provided")
                                     mtime-matches
                                     new-mtime))
                 ;; Buffer needs revert - only do so if no unsaved changes
@@ -2491,8 +2484,7 @@ PARAMS contains :procId, :stream (stdout/stderr), and :data (base64-encoded)."
   (let* ((proc-id (plist-get params :procId))
          (stream (plist-get params :stream))
          ;; Data is base64-encoded by the server to safely transport binary data
-         (encoded-data (plist-get params :data))
-         (data (base64-decode-string encoded-data))
+         (data (plist-get params :data))
          (proc (gethash proc-id flit--processes)))
     ;; Avoid logging huge elisp objects (workspace/client structs, filters).
     (flit--log-debug "exec-output: proc-id=%s stream=%s len=%d live=%s name=%s"
@@ -2703,7 +2695,7 @@ Uses cached content if available, otherwise fetches via fs/read."
                (stat (plist-get result :stat)))
           (when content
             (flit--cache-put host path stat)
-            (list :content (base64-decode-string content)
+            (list :content content
                   :stat stat)))))))
 
 (defun flit--write (filename content &optional expected-mtime)
@@ -2714,12 +2706,12 @@ If nil or 0, we expect the file to not exist (new file).
 If the file's actual state doesn't match, prompts user before
 overwriting."
   (flit--with-parsed (host path) filename
-    ;; Encode using buffer's coding system before base64 - base64-encode-string requires unibyte
+    ;; Encode using buffer's coding system — sent as raw bytes via msgpack
     ;; If coding system is undecided or nil, use UTF-8
     (let* ((coding (or buffer-file-coding-system 'utf-8-unix))
            (base (coding-system-base coding))
            (actual-coding (if (eq base 'undecided) 'utf-8-unix coding))
-           (encoded (base64-encode-string (encode-coding-string content actual-coding) t))
+           (raw-bytes (encode-coding-string content actual-coding))
            ;; Convert expected-mtime: nil/0 means "expect non-existent"
            (expect-mtime (when (and expected-mtime
                                     (not (equal expected-mtime 0))
@@ -2727,7 +2719,7 @@ overwriting."
                            (if (listp expected-mtime)
                                (float-time expected-mtime)
                              expected-mtime)))
-           (params `(:path ,path :content ,encoded))
+           (params `(:path ,path :content (:bin . ,raw-bytes)))
            result)
       ;; Add expectedMtime if we have an expectation
       (when expect-mtime
@@ -2751,9 +2743,9 @@ overwriting."
         (setq params (plist-put params :force t))
         (setq result (flit--send-request host "fs/write" params)))
       ;; Server returns updated file info (without content since client already has it)
-      ;; Add the content we just wrote (base64 encoded) before caching
+      ;; Add the content we just wrote (raw bytes) before caching
       (when (and result (not (plist-get result :mismatch)) (< (length content) (* 1024 1024)))
-        (setq result (plist-put result :content encoded)))
+        (setq result (plist-put result :content raw-bytes)))
       ;; Use unified cache function
       (when (and result (not (plist-get result :mismatch)))
         (flit--cache-from-response host result))
@@ -5299,9 +5291,8 @@ A new client has connected to a remote tunnel listener."
 
 (defun flit--tunnel-send-data (host conn-id data)
   "Send DATA from local connection CONN-ID to the remote via HOST."
-  (let ((encoded (base64-encode-string data t)))
-    (flit--send-notify host "tunnel/data"
-                       `(:connId ,conn-id :data ,encoded))))
+  (flit--send-notify host "tunnel/data"
+                     `(:connId ,conn-id :data (:bin . ,data))))
 
 (defun flit--tunnel-local-disconnected (tunnel-id conn-id)
   "Handle local connection CONN-ID in tunnel TUNNEL-ID being closed."
@@ -5319,14 +5310,14 @@ A new client has connected to a remote tunnel listener."
 (defun flit--handle-tunnel-data (_conn params)
   "Handle a tunnel/data notification with PARAMS."
   (let* ((conn-id (plist-get params :connId))
-         (data-encoded (plist-get params :data))
+         (data (plist-get params :data))
          (tunnel-id (plist-get params :tunnelId))
          (tunnel (gethash tunnel-id flit--tunnels)))
     (when tunnel
       (let* ((conns (plist-get tunnel :connections))
              (proc (gethash conn-id conns)))
         (when (and proc (process-live-p proc))
-          (process-send-string proc (base64-decode-string data-encoded)))))))
+          (process-send-string proc data))))))
 
 (defun flit--handle-tunnel-disconnect (_conn params)
   "Handle a tunnel/disconnect notification with PARAMS."
