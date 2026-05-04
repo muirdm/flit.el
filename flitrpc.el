@@ -550,7 +550,7 @@ by notification callbacks) see a clean buffer."
               ;; Delete frame from buffer BEFORE dispatch so re-entrant
               ;; calls (from sync RPCs in notification callbacks) don't
               ;; re-process this frame.
-              (delete-region (point-min) payload-end)
+              (delete-region (point-min) (min payload-end (point-max)))
               (flitrpc--dispatch-frame conn meta payload-data)
               ;; If a sync request just completed, stop processing.
               (when (flitrpc-conn-sync-done conn)
