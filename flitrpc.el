@@ -665,24 +665,26 @@ Nested calls work: each has its own done/result variables."
         (err nil)
         (deadline (+ (float-time) (or timeout 5)))
         (proc (flitrpc-conn-process conn)))
-    (flitrpc-request conn method params
-                     (lambda (meta payload-data)
-                       (when payload-data
-                         (setq meta (plist-put (copy-sequence meta)
-                                              :payload payload-data)))
-                       (setf (flitrpc-conn-sync-done conn) t)
-                       (setq result meta done t))
-                     (lambda (e)
-                       (setf (flitrpc-conn-sync-done conn) t)
-                       (setq err e done t))
-                     payload)
-    (while (not done)
-      (when (> (float-time) deadline)
-        (setq err '(:message "Timed out") done t))
-      (accept-process-output proc 0.5))
-    (when err
-      (signal 'flitrpc-error (list err)))
-    result))
+    (let ((req-id (flitrpc-request conn method params
+                                    (lambda (meta payload-data)
+                                      (when payload-data
+                                        (setq meta (plist-put (copy-sequence meta)
+                                                              :payload payload-data)))
+                                      (setf (flitrpc-conn-sync-done conn) t)
+                                      (setq result meta done t))
+                                    (lambda (e)
+                                      (setf (flitrpc-conn-sync-done conn) t)
+                                      (setq err e done t))
+                                    payload)))
+      (while (not done)
+        (when (> (float-time) deadline)
+          ;; Clean up pending entry so late responses don't hit stale callback
+          (remhash req-id (flitrpc-conn-pending conn))
+          (setq err '(:message "Timed out") done t))
+        (accept-process-output proc 0.5))
+      (when err
+        (signal 'flitrpc-error (list err)))
+      result)))
 
 (defun flitrpc-request-sync-with-payload (conn method params &optional timeout)
   "Like `flitrpc-request-sync' but also return payload data.
@@ -693,17 +695,18 @@ Returns (META PAYLOAD-DATA) list."
         (err nil)
         (deadline (+ (float-time) (or timeout 5)))
         (proc (flitrpc-conn-process conn)))
-    (flitrpc-request conn method params
-                     (lambda (meta payload-data)
-                       (setq result-meta meta result-payload payload-data done t))
-                     (lambda (e) (setq err e done t)))
-    (while (not done)
-      (when (> (float-time) deadline)
-        (setq err '(:message "Timed out") done t))
-      (accept-process-output proc 0.5))
-    (when err
-      (signal 'flitrpc-error (list err)))
-    (list result-meta result-payload)))
+    (let ((req-id (flitrpc-request conn method params
+                                    (lambda (meta payload-data)
+                                      (setq result-meta meta result-payload payload-data done t))
+                                    (lambda (e) (setq err e done t)))))
+      (while (not done)
+        (when (> (float-time) deadline)
+          (remhash req-id (flitrpc-conn-pending conn))
+          (setq err '(:message "Timed out") done t))
+        (accept-process-output proc 0.5))
+      (when err
+        (signal 'flitrpc-error (list err)))
+      (list result-meta result-payload))))
 
 (define-error 'flitrpc-error "flitrpc error")
 
