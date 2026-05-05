@@ -25,6 +25,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'subr-x)
 (require 'flitrpc)
 
 ;; Forward declarations for variables defined later in the file.
