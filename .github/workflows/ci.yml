@@ -32,4 +32,6 @@ jobs:
 
       - name: Run ERT tests
         run: |
+          emacs --version
+          which emacs
           FLIT_SERVER_BINARY=${{ github.workspace }}/flit emacs --batch -L . -l flit-test.el -f ert-run-tests-batch-and-exit

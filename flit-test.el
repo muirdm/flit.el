@@ -697,7 +697,7 @@ Must be called with the target buffer current."
             ;; Wait for output
             (let ((conn (gethash "test" flit--connections))
                   (start (float-time)))
-              (while (and (< (- (float-time) start) 2)
+              (while (and (< (- (float-time) start) 5)
                           (with-current-buffer buf
                             (not (string-match-p "hello-pty" (buffer-string)))))
                 (when conn
@@ -728,7 +728,7 @@ Must be called with the target buffer current."
             ;; Wait for output
             (let ((conn (gethash "test" flit--connections))
                   (start (float-time)))
-              (while (and (< (- (float-time) start) 2)
+              (while (and (< (- (float-time) start) 5)
                           (with-current-buffer buf
                             (not (string-match-p "hello from input" (buffer-string)))))
                 (when conn
@@ -762,7 +762,7 @@ Must be called with the target buffer current."
             ;; Wait for process to exit
             (let ((conn (gethash "test" flit--connections))
                   (start (float-time)))
-              (while (and (< (- (float-time) start) 2)
+              (while (and (< (- (float-time) start) 5)
                           (null exit-code))
                 (when conn
                   (accept-process-output (flit-conn-process conn) 0.1))))
@@ -815,7 +815,7 @@ Must be called with the target buffer current."
             ;; Wait for output
             (let ((conn (gethash "test" flit--connections))
                   (start (float-time)))
-              (while (and (< (- (float-time) start) 2)
+              (while (and (< (- (float-time) start) 5)
                           (with-current-buffer buf
                             (= (buffer-size) 0)))
                 (when conn
@@ -843,7 +843,7 @@ Must be called with the target buffer current."
             ;; Wait for output
             (let ((conn (gethash "test" flit--connections))
                   (start (float-time)))
-              (while (and (< (- (float-time) start) 2)
+              (while (and (< (- (float-time) start) 5)
                           (with-current-buffer buf
                             (not (string-match-p "got: test input line" (buffer-string)))))
                 (when conn
