@@ -3075,6 +3075,10 @@ Server will stop watching and stop pushing notifications."
     ;; Enable auto-revert for this buffer even though it's "remote"
     ;; This is safe because flit uses push-based file watching, not polling
     (setq-local auto-revert-remote-files t)
+    ;; Disable file-notify for this buffer — flit has its own push-based
+    ;; watching and file-notify-add-watch signals an error for flit paths.
+    ;; Without this, auto-revert retries file-notify-add-watch every tick.
+    (setq-local auto-revert-use-notify nil)
     ;; Unwatch when buffer is killed
     (add-hook 'kill-buffer-hook #'flit--teardown-file-watch nil t)))
 
