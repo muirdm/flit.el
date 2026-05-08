@@ -1605,6 +1605,14 @@ the final connection with `flit--make-connection'."
     ((or "aarch64" "arm64") "arm64")
     (_ (downcase (or name "")))))
 
+(defun flit--y-or-n-p (prompt)
+  "Like `y-or-n-p' but safe to call during completion.
+Completion frameworks like vertico use `while-no-input' which
+aborts via throw when input arrives — before `y-or-n-p' can
+consume it as an answer."
+  (let ((throw-on-input nil))
+    (y-or-n-p prompt)))
+
 (defun flit--find-local-binary ()
   "Find the local flit binary.
 Search order: `exec-path', then source-dir/flit.
@@ -1613,7 +1621,7 @@ Checks proto version matches — prompts to recompile if stale."
   (let ((binary (or (executable-find "flit")
                     (let ((in-source (expand-file-name "flit" flit--source-directory)))
                       (and (file-executable-p in-source) in-source))
-                    (when (y-or-n-p "Local flit binary not found. Compile now?")
+                    (when (flit--y-or-n-p "Local flit binary not found. Compile now?")
                       (flit--compile-local))
                     (error "flit binary not found"))))
     (flit--check-local-binary-version binary)
@@ -1627,8 +1635,8 @@ Signals an error with a recompile suggestion if mismatched."
                    (with-current-buffer standard-output
                      (call-process binary nil t nil "version"))))))
     (unless (equal output (number-to-string flit--proto-version))
-      (if (y-or-n-p (format "Local flit binary (proto %s) doesn't match client (proto %d). Recompile?"
-                            output flit--proto-version))
+      (if (flit--y-or-n-p (format "Local flit binary (proto %s) doesn't match client (proto %d). Recompile?"
+                                  output flit--proto-version))
           (flit--compile-local)
         (error "Flit binary version mismatch")))))
 
@@ -1927,8 +1935,8 @@ Does NOT call CALLBACK — the state machine continues waiting for flit_ready."
     (flit--log-info "handshake[%s]: flit not found (uname=%s, %s/%s)"
                     host uname goos goarch)
     (if (and allow-prompt
-             (y-or-n-p (format "flit not found on %s. Deploy (%s/%s)? "
-                               host goos goarch)))
+             (flit--y-or-n-p (format "flit not found on %s. Deploy (%s/%s)? "
+                                    host goos goarch)))
         (condition-case err
             (let* ((binary-path (flit--compile-for-remote goos goarch))
                    (size (file-attribute-size
