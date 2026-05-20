@@ -1303,7 +1303,11 @@ via `flit--allow-prompt-p'."
     ;; State for waiting (sync mode)
     (let ((done nil)
           (result-conn nil)
-          (result-error nil))
+          (result-error nil)
+          ;; Deadline for sync connect loop.  Starts generous for the
+          ;; handshake (password prompts, binary deploy), then tightens
+          ;; when init starts.  Not used in async mode.
+          (sync-deadline nil))
 
       (unwind-protect
           (progn
@@ -1311,6 +1315,7 @@ via `flit--allow-prompt-p'."
             (if async
                 (flit--log-info "Async connecting to %s (allow-prompt=%s)..." host allow-prompt)
               (flit--log-info "Sync connecting to %s (allow-prompt=%s)..." host allow-prompt)
+              (setq sync-deadline (+ (float-time) 180))
               ;; Show message - use minibuffer-message when in minibuffer to avoid being overwritten
               ;; minibuffer-message adds its own brackets, so omit ours there
               (if (active-minibuffer-window)
@@ -1325,22 +1330,25 @@ via `flit--allow-prompt-p'."
                    (lambda (conn error-msg)
                      (if conn
                          ;; Connection created, now initialize
-                         (flit--initialize-connection
-                          host conn
-                          (lambda (init-success init-error)
-                            (if init-success
-                                (progn
-                                  (puthash host conn flit--connections)
-                                  (flit--set-connection-state host 'connected)
-                                  (cl-pushnew host flit-known-hosts :test #'equal)
-                                  (flit--reregister-watches host)
-                                  (flit--log-info "Connection to %s complete" host)
-                                  (flit--run-after-connect-functions host)
-                                  (setq result-conn conn done t)
-                                  (when callback (funcall callback host t nil)))
-                              (flit--set-connection-failed host init-error)
-                              (setq result-error init-error done t)
-                              (when callback (funcall callback host nil init-error)))))
+                         (progn
+                           (when sync-deadline
+                             (setq sync-deadline (+ (float-time) 30)))
+                           (flit--initialize-connection
+                            host conn
+                            (lambda (init-success init-error)
+                              (if init-success
+                                  (progn
+                                    (puthash host conn flit--connections)
+                                    (flit--set-connection-state host 'connected)
+                                    (cl-pushnew host flit-known-hosts :test #'equal)
+                                    (flit--reregister-watches host)
+                                    (flit--log-info "Connection to %s complete" host)
+                                    (flit--run-after-connect-functions host)
+                                    (setq result-conn conn done t)
+                                    (when callback (funcall callback host t nil)))
+                                (flit--set-connection-failed host init-error)
+                                (setq result-error init-error done t)
+                                (when callback (funcall callback host nil init-error))))))
                        ;; Connection creation failed
                        (flit--set-connection-failed host error-msg)
                        (setq result-error error-msg done t)
@@ -1354,8 +1362,10 @@ via `flit--allow-prompt-p'."
             ;; For sync mode, wait for completion
             (unless async
               (flit--with-quit-log (format "connecting to %s" host)
-                (while (not done)
+                (while (and (not done) (< (float-time) sync-deadline))
                   (accept-process-output nil 0.1)))
+              (unless done
+                (setq result-error "Connection timed out"))
               (if result-error
                   (error "Failed to connect to %s: %s" host result-error)
                 result-conn)))
