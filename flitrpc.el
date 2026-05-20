@@ -509,8 +509,9 @@ ARGS are keyword args: :notification-fn, :request-fn, :on-shutdown."
 
 (defun flitrpc--make-sentinel (conn)
   "Return a process sentinel function for CONN."
-  (lambda (_proc event)
-    (when (string-match-p "\\(?:exited\\|killed\\|finished\\|deleted\\|connection broken\\)" event)
+  (lambda (proc event)
+    (ignore event)
+    (unless (process-live-p proc)
       (when-let ((fn (flitrpc-conn-on-shutdown conn)))
         (funcall fn conn))
       ;; Fail all pending requests
