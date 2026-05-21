@@ -1333,22 +1333,28 @@ via `flit--allow-prompt-p'."
                          (progn
                            (when sync-deadline
                              (setq sync-deadline (+ (float-time) 30)))
-                           (flit--initialize-connection
-                            host conn
-                            (lambda (init-success init-error)
-                              (if init-success
-                                  (progn
-                                    (puthash host conn flit--connections)
-                                    (flit--set-connection-state host 'connected)
-                                    (cl-pushnew host flit-known-hosts :test #'equal)
-                                    (flit--reregister-watches host)
-                                    (flit--log-info "Connection to %s complete" host)
-                                    (flit--run-after-connect-functions host)
-                                    (setq result-conn conn done t)
-                                    (when callback (funcall callback host t nil)))
-                                (flit--set-connection-failed host init-error)
-                                (setq result-error init-error done t)
-                                (when callback (funcall callback host nil init-error))))))
+                           (condition-case err
+                               (flit--initialize-connection
+                                host conn
+                                (lambda (init-success init-error)
+                                  (if init-success
+                                      (progn
+                                        (puthash host conn flit--connections)
+                                        (flit--set-connection-state host 'connected)
+                                        (cl-pushnew host flit-known-hosts :test #'equal)
+                                        (flit--reregister-watches host)
+                                        (flit--log-info "Connection to %s complete" host)
+                                        (flit--run-after-connect-functions host)
+                                        (setq result-conn conn done t)
+                                        (when callback (funcall callback host t nil)))
+                                    (flit--set-connection-failed host init-error)
+                                    (setq result-error init-error done t)
+                                    (when callback (funcall callback host nil init-error)))))
+                             (error
+                              (let ((msg (format "Init send failed: %s" (error-message-string err))))
+                                (flit--log-info "%s" msg)
+                                (flit--set-connection-failed host msg)
+                                (setq result-error msg done t)))))
                        ;; Connection creation failed
                        (flit--set-connection-failed host error-msg)
                        (setq result-error error-msg done t)

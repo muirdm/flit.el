@@ -40,6 +40,7 @@ func runServer(args []string) {
 	verbose := fs.Bool("verbose", false, "Enable verbose logging (includes debug messages)")
 	quiet := fs.Bool("quiet", false, "Quiet mode (only show errors)")
 	stdio := fs.Bool("stdio", false, "Use stdin/stdout instead of TCP")
+	logFile := fs.String("log-file", "", "Write logs to this file (useful for stdio mode debugging)")
 
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, `Usage: flit server [options]
@@ -73,7 +74,16 @@ Options:`)
 	}
 
 	// Configure logging based on mode
-	if *stdio {
+	if *logFile != "" {
+		f, err := os.Create(*logFile)
+		if err != nil {
+			log.Fatalf("Failed to open log file %s: %v", *logFile, err)
+		}
+		defer f.Close()
+		handler := slog.NewTextHandler(f, &slog.HandlerOptions{Level: slog.LevelDebug})
+		slog.SetDefault(slog.New(handler))
+		log.SetOutput(f)
+	} else if *stdio {
 		// In stdio mode, discard global logs - they would corrupt the JSON-RPC stream
 		// Session-specific logs are sent back via RPC notifications
 		slog.SetDefault(slog.New(server.DiscardHandler{}))

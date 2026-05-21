@@ -33,6 +33,9 @@
 (defvar flit-test--saved-connection-methods nil
   "Saved connection methods to restore after tests.")
 
+(defvar flit-test--server-log-file nil
+  "Path to the server log file for the current test.")
+
 (defun flit-test--setup ()
   "Set up test environment."
   ;; Get server binary from environment
@@ -43,8 +46,10 @@
       (error "FLIT_SERVER_BINARY %s is not executable" binary))
     ;; Save existing config and set up for testing
     (setq flit-test--saved-connection-methods flit-connection-methods)
+    (setq flit-test--server-log-file (make-temp-file "flit-server-log-" nil ".log"))
     (setq flit-connection-methods
-          `((,flit-test--host . (:stdio (,binary "server" "--stdio"))))))
+          `((,flit-test--host . (:stdio (,binary "server" "--stdio"
+                                                  "--log-file" ,flit-test--server-log-file))))))
 
   ;; Create temp directory
   (setq flit-test--temp-dir (make-temp-file "flit-test-" t))
@@ -71,20 +76,34 @@
 
   ;; Reset state
   (setq flit-test--temp-dir nil)
-  (setq flit-connection-methods flit-test--saved-connection-methods))
+  (setq flit-connection-methods flit-test--saved-connection-methods)
+  ;; Clean up server log file
+  (when flit-test--server-log-file
+    (ignore-errors (delete-file flit-test--server-log-file))
+    (setq flit-test--server-log-file nil)))
 
 (defmacro flit-test--with-fixture (&rest body)
   "Execute BODY with test fixture set up and torn down."
   (declare (indent 0) (debug t))
-  `(unwind-protect
-       (progn
-         (flit-test--setup)
-         ;; Use pipe mode for tests - PTY mode is tested separately
-         ;; Tests are explicit actions so use 'connect tier
-         (let ((process-connection-type nil)
-               (flit--connection-tier 'connect))
-           ,@body))
-     (flit-test--teardown)))
+  `(let ((flit-test--fixture-ok nil))
+     (unwind-protect
+         (progn
+           (flit-test--setup)
+           ;; Use pipe mode for tests - PTY mode is tested separately
+           ;; Tests are explicit actions so use 'connect tier
+           (let ((process-connection-type nil)
+                 (flit--connection-tier 'connect))
+             ,@body)
+           (setq flit-test--fixture-ok t))
+       (unless flit-test--fixture-ok
+         (when (and flit-test--server-log-file
+                    (file-exists-p flit-test--server-log-file))
+           (message "=== Server log (test failure) ===")
+           (message "%s" (with-temp-buffer
+                           (insert-file-contents flit-test--server-log-file)
+                           (buffer-string)))
+           (message "=== End server log ===")))
+       (flit-test--teardown))))
 
 (defun flit-test--path (relative)
   "Return a flit path for RELATIVE path in test temp dir."
