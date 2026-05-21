@@ -1197,6 +1197,7 @@ func (s *Server) registerHandlers(rpc *flitrpc.Server, sess *Session) {
 
 	// Init
 	rpc.HandleFunc("init", func(_ msgpack.RawMessage) (any, error) {
+		initStart := time.Now()
 		s.touch()
 		result := &InitResult{}
 		result.OS = runtime.GOOS
@@ -1225,10 +1226,12 @@ func (s *Server) registerHandlers(rpc *flitrpc.Server, sess *Session) {
 		}
 		result.PathDirs = make([]PathDirEntry, len(pathDirs))
 		wg := util.NewBoundedWaitGroup(32)
+		var dirTimings sync.Map
 		for i, dir := range pathDirs {
 			wg.Add(1)
 			go func(idx int, dirPath string) {
 				defer wg.Done()
+				dirStart := time.Now()
 				entry := PathDirEntry{Path: dirPath}
 				children, err := s.fsHandler.ReadDirWithTypes(dirPath)
 				if err != nil {
@@ -1237,9 +1240,20 @@ func (s *Server) registerHandlers(rpc *flitrpc.Server, sess *Session) {
 					entry.Children = &children
 				}
 				result.PathDirs[idx] = entry
+				dirTimings.Store(dirPath, time.Since(dirStart))
 			}(i, dir)
 		}
 		wg.Wait()
+		elapsed := time.Since(initStart)
+		slog.Info("init handler complete", "elapsed", elapsed, "pathDirs", len(pathDirs))
+		if elapsed > 100*time.Millisecond {
+			dirTimings.Range(func(key, value any) bool {
+				if d := value.(time.Duration); d > 50*time.Millisecond {
+					slog.Info("init slow dir", "dir", key, "elapsed", d)
+				}
+				return true
+			})
+		}
 		return result, nil
 	})
 
