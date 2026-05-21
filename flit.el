@@ -1518,7 +1518,7 @@ the final connection with `flit--make-connection'."
                (proc (make-process
                       :name proc-name
                       :command command
-                      :coding 'utf-8-emacs-unix
+                      :coding 'binary
                       :connection-type 'pipe
                       :noquery t
                       :stderr stderr-buf)))
@@ -1579,7 +1579,7 @@ the final connection with `flit--make-connection'."
                       (list :name (format "flit-%s" host)
                             :host tcp-host
                             :service tcp-port
-                            :coding 'utf-8-emacs-unix
+                            :coding 'binary
                             :noquery t)
                       (when (>= emacs-major-version 28)
                         '(:nodelay t))))))
@@ -1762,28 +1762,38 @@ Accumulates OUTPUT, extracts complete lines, parses JSON, calls handler."
     (setq pending (concat pending output))
     (process-put proc 'flit-sm-pending pending)
     (flit--log-info "sm filter: output=%S pending-len=%d" output (length pending))
-    (while (string-match "^\\([^\n]*\\)\n" pending)
-      (let* ((raw-line (match-string 1 pending))
-             (line (string-trim-right raw-line "\r"))
-             ;; Strip ANSI escape sequences that may be prepended by PTY output.
-             (json-line (replace-regexp-in-string "\x1b\\[[0-9;?]*[a-zA-Z]" "" line))
-             (json-line (string-trim json-line))
-             (json-obj (condition-case err
-                           (json-parse-string json-line :object-type 'plist)
-                         (error
-                          (flit--log-info "sm filter: JSON parse failed for %S: %s"
-                                          line (error-message-string err))
-                          nil)))
-             (handler (process-get proc 'flit-sm-handler)))
-        (setq pending (substring pending (match-end 0)))
-        (process-put proc 'flit-sm-pending pending)
-        (if handler
-            (progn
-              (flit--log-info "sm filter: dispatching line=%S json-keys=%S"
-                              line (and json-obj (cl-loop for (k _v) on json-obj by #'cddr
-                                                          collect k)))
-              (funcall handler proc json-obj line))
-          (flit--log-info "sm filter: no handler, dropping line=%S" line))))))
+    (let ((sm-done nil))
+      (while (and (not sm-done) (string-match "^\\([^\n]*\\)\n" pending))
+        (let* ((raw-line (match-string 1 pending))
+               (line (string-trim-right raw-line "\r"))
+               ;; Strip ANSI escape sequences that may be prepended by PTY output.
+               (json-line (replace-regexp-in-string "\x1b\\[[0-9;?]*[a-zA-Z]" "" line))
+               (json-line (string-trim json-line))
+               (json-obj (condition-case err
+                             (json-parse-string json-line :object-type 'plist)
+                           (error
+                            (flit--log-info "sm filter: JSON parse failed for %S: %s"
+                                            line (error-message-string err))
+                            nil)))
+               (handler (process-get proc 'flit-sm-handler)))
+          (setq pending (substring pending (match-end 0)))
+          (process-put proc 'flit-sm-pending pending)
+          (if handler
+              (progn
+                (flit--log-info "sm filter: dispatching line=%S json-keys=%S"
+                                line (and json-obj (cl-loop for (k _v) on json-obj by #'cddr
+                                                            collect k)))
+                (funcall handler proc json-obj line)
+                ;; If the handler completed the SM (cleared itself), stop
+                ;; consuming data and forward any remaining bytes to the
+                ;; new process filter so they aren't lost.
+                (unless (process-get proc 'flit-sm-handler)
+                  (when (> (length pending) 0)
+                    (let ((new-filter (process-filter proc)))
+                      (when new-filter
+                        (funcall new-filter proc pending))))
+                  (setq sm-done t)))
+            (flit--log-info "sm filter: no handler, dropping line=%S" line)))))))
 
 (defun flit--sm-goto (proc handler)
   "Set PROC's current state handler to HANDLER."
