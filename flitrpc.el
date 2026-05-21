@@ -493,7 +493,6 @@ ARGS are keyword args: :notification-fn, :request-fn, :on-shutdown."
     (set-process-buffer process buf)
     (set-process-filter process (flitrpc--make-filter conn))
     (set-process-sentinel process (flitrpc--make-sentinel conn))
-    (set-process-coding-system process 'binary 'binary)
     conn))
 
 (defun flitrpc--make-filter (conn)
