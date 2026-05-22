@@ -1054,6 +1054,11 @@ Must be called with the target buffer current."
       (with-timeout (5 (error "Batch prefetch timed out"))
         (while (not done)
           (accept-process-output nil 0.1))))
+    ;; Parent dir info arrives as async fs/entryInfo notifications
+    ;; which may still be in the pipe after the fs/batch response.
+    (flit-test--wait-for
+     (lambda ()
+       (flit--cache-get flit-test--host flit-test--temp-dir)))
     ;; Check parent directory was also cached with children
     (let ((dir-info (flit--cache-get flit-test--host flit-test--temp-dir)))
       (should dir-info)
